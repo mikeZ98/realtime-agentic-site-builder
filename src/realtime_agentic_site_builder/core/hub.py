@@ -11,7 +11,7 @@ import contextlib
 import logging
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from functools import partial
 from typing import Annotated, Any, Final, Literal, Protocol, Self, cast
@@ -23,14 +23,16 @@ from redis.exceptions import RedisError
 from realtime_agentic_site_builder.config import Settings, get_settings
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
 from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager, LockEvent
-from realtime_agentic_site_builder.core.patch_engine import PatchEngine
+from realtime_agentic_site_builder.core.patch_engine import PatchEngine, changed_elements
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
 from realtime_agentic_site_builder.domain.base import DomainModel, Identifier
 from realtime_agentic_site_builder.domain.errors import (
     DeltaRejectedError,
+    ElementLockConflictError,
     SessionAlreadyExistsError,
     SessionNotFoundError,
     SiteBuilderError,
+    element_resource_uri,
 )
 from realtime_agentic_site_builder.domain.swarm import (
     AgentCursorFrame,
@@ -344,6 +346,16 @@ class _Session:
             session_id=self.session_id, deltas=tuple(self.deltas), snapshots=tuple(self.snapshots)
         )
 
+    def require_locks(self, agent_id: str, target_ids: Iterable[str], now_ms: int) -> None:
+        """Reject the agent unless it has a live hold on every target, naming the first it lacks."""
+        for target_id in sorted(target_ids):
+            holder = self.locks.live_holder(target_id, now_ms)
+            if holder != agent_id:
+                raise ElementLockConflictError(
+                    competing_agent_ids=(agent_id,) if holder is None else (agent_id, holder),
+                    resource_uri=element_resource_uri(target_id),
+                )
+
     def frames_for_snapshot(self) -> tuple[AgentCursorFrame, ...]:
         """Return the latest frames, clearing locks that were released since each was sent.
 
@@ -452,7 +464,11 @@ class SwarmSessionHub:
     async def apply_delta(self, session_id: str, delta: StreamDelta) -> SwarmSnapshot:
         """Commit a delta, record it for replay and announce the new state.
 
-        Nothing about the session changes unless the delta is fully accepted.
+        Nothing about the session changes unless the delta is fully accepted. Its agent must hold
+        a live lock on ``target_id``, on everything each pointer in the patch resolves to, and on
+        everything the result turns out to change, which is how reordering is caught, since no
+        pointer names it. Otherwise this raises ``ElementLockConflictError``. No await separates
+        these checks from the commit, so a lease cannot be lost in between.
         """
         if delta.session_id != session_id:
             raise DeltaRejectedError(
@@ -467,8 +483,15 @@ class SwarmSessionHub:
                     session_id=session_id,
                     delta_seq=delta.delta_seq,
                 )
-            bundle, _ = self._engine.apply_patch(session.latest.bundle_state, delta)
             now_ms = self._clock()
+            session.require_locks(delta.agent_id, (delta.target_id,), now_ms)
+            prior = session.latest.bundle_state
+            bundle, _ = self._engine.apply_patch(
+                prior,
+                delta,
+                authorize=lambda touched: session.require_locks(delta.agent_id, touched, now_ms),
+            )
+            session.require_locks(delta.agent_id, changed_elements(prior, bundle), now_ms)
             snapshot = self._engine.generate_snapshot(
                 bundle,
                 session.latest.frame_seq + 1,
@@ -577,7 +600,10 @@ class SwarmSessionHub:
 
     @staticmethod
     def _adopt(session: _Session, event: StateEvent) -> bool:
-        """Take another worker's commit into this replica, unless it would rewrite history."""
+        """Take another worker's commit into this replica, unless it would rewrite history.
+
+        Locks are not checked here: they live on the writing worker, which already enforced them.
+        """
         snapshot = event.snapshot
         if (
             event.delta.delta_seq <= session.last_delta_seq

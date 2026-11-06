@@ -115,6 +115,13 @@ class AsyncLockManager:
         self._break_deadlocks(now_ms)
         return reclaimed
 
+    def live_holder(self, target_id: str, now_ms: int) -> str | None:
+        """Return who holds the element. A lapsed lease counts as nobody, even before a sweep."""
+        holder = self._holders.get(target_id)
+        if holder is None or holder.is_expired(now_ms):
+            return None
+        return holder.locked_by_agent_id
+
     def active_locks(self) -> tuple[ElementLock, ...]:
         """Return every hold and queued request, in an order that is stable across replicas."""
         queued = (lock for queue in self._waiters.values() for lock in queue.values())

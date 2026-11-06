@@ -222,6 +222,7 @@ def make_snapshot(frame_seq: int = 0, timestamp_ms: int = 1000) -> SwarmSnapshot
 def make_delta(delta_seq: int = 0, session_id: str = "session-1") -> StreamDelta:
     return StreamDelta(
         session_id=session_id,
+        agent_id="agent-1",
         delta_seq=delta_seq,
         target_domain="frontend",
         target_id="hero",
@@ -1155,12 +1156,34 @@ def test_patch_values_must_be_json_compatible() -> None:
     [
         {"patches": []},
         {"delta_seq": -1},
+        {"agent_id": "bad id!"},
+        {"agent_id": ""},
+        {"agent_id": None},
         {"target_domain": "database"},
         {"emitted_at_ms": -1},
     ],
 )
 def test_invalid_deltas_are_rejected(overrides: dict[str, object]) -> None:
     payload = {**make_delta().model_dump(mode="json"), **overrides}
+    with pytest.raises(ValidationError):
+        StreamDelta.model_validate(payload)
+
+
+def test_delta_requires_an_author() -> None:
+    payload = make_delta().model_dump(mode="json")
+    del payload["agent_id"]
+    with pytest.raises(ValidationError, match="agent_id"):
+        StreamDelta.model_validate(payload)
+
+
+def test_delta_author_is_normalized_to_match_lock_owners() -> None:
+    payload = {**make_delta().model_dump(mode="json"), "agent_id": "  agent-1  "}
+    assert StreamDelta.model_validate(payload).agent_id == "agent-1"
+
+
+@pytest.mark.parametrize("agent_id", ["   ", "<script>", "a b", "a\nb", "x" * 129])
+def test_delta_author_rejects_unsanitary_values(agent_id: str) -> None:
+    payload = {**make_delta().model_dump(mode="json"), "agent_id": agent_id}
     with pytest.raises(ValidationError):
         StreamDelta.model_validate(payload)
 

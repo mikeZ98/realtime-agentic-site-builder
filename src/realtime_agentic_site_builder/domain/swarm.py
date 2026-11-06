@@ -377,6 +377,7 @@ class PatchOperation(DomainModel):
 
 class StreamDelta(DomainModel):
     session_id: Identifier
+    agent_id: Identifier
     delta_seq: NonNegativeInt
     target_domain: Literal["frontend", "backend"]
     target_id: Identifier

@@ -2,9 +2,10 @@
 
 import copy
 import re
+from collections.abc import Callable, Mapping
 from typing import Any, Final
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
@@ -29,6 +30,20 @@ from realtime_agentic_site_builder.domain.swarm import (
 )
 
 DEFAULT_MAX_PATCH_SIZE_BYTES: Final = 65536
+# Lock targets for what belongs to no single element: site or service fields, and element order.
+# The colon keeps them distinct: component ids, model names and endpoint ids cannot contain one.
+FRONTEND_DOCUMENT_LOCK: Final = "frontend:document"
+BACKEND_DOCUMENT_LOCK: Final = "backend:document"
+_DOCUMENT_LOCKS: Final = {"frontend": FRONTEND_DOCUMENT_LOCK, "backend": BACKEND_DOCUMENT_LOCK}
+# Each domain's lockable collections, and the member that identifies an element of each.
+_ELEMENT_KEYS: Final = {
+    "frontend": {"components": "id"},
+    "backend": {"models": "name", "endpoints": "id"},
+}
+_INSERTING_OPS: Final = frozenset({JsonPatchOp.ADD, JsonPatchOp.MOVE, JsonPatchOp.COPY})
+_VALUE_WRITING_OPS: Final = frozenset({JsonPatchOp.ADD, JsonPatchOp.REPLACE})
+
+Authorizer = Callable[[frozenset[str]], None]
 
 # RFC 6901 forbids leading zeros. The digit cap keeps int() clear of its conversion limit, and no
 # real array comes near that length.
@@ -187,6 +202,138 @@ def _describe(error: ValidationError) -> str:
     return f"patched bundle violates its schema at {location or 'root'}: {first['msg']}"
 
 
+def _element_id(item: Any, key: str) -> set[str]:
+    element_id = item.get(key) if isinstance(item, dict) else None
+    return {element_id} if isinstance(element_id, str) else set()
+
+
+def _collection_ids(items: Any, key: str) -> set[str]:
+    if not isinstance(items, list):
+        return set()
+    return {element_id for item in items for element_id in _element_id(item, key)}
+
+
+def _domain_ids(section: Any, domain: str) -> set[str]:
+    members = section if isinstance(section, dict) else {}
+    return {
+        element_id
+        for name, key in _ELEMENT_KEYS[domain].items()
+        for element_id in _collection_ids(members.get(name), key)
+    }
+
+
+def _existing_elements(
+    document: dict[str, Any], tokens: tuple[str, ...], *, inserting: bool
+) -> set[str]:
+    """Map a pointer to the lock targets it addresses in the document as it stands.
+
+    Inserting at an array index shifts the element there without changing it, so it does not touch
+    that element. A pointer that resolves to nothing touches nothing, and fails when applied.
+    """
+    domain, *rest = tokens
+    document_lock = _DOCUMENT_LOCKS[domain]
+    section = document.get(domain)
+    if not rest:
+        return {document_lock} | _domain_ids(section, domain)
+    name, *inner = rest
+    key = _ELEMENT_KEYS[domain].get(name)
+    if key is None:
+        return {document_lock}
+    items = section.get(name) if isinstance(section, dict) else None
+    if not inner:
+        return {document_lock} | _collection_ids(items, key)
+    if (
+        (inserting and len(inner) == 1)
+        or not isinstance(items, list)
+        or _ARRAY_INDEX.fullmatch(inner[0]) is None
+        or int(inner[0]) >= len(items)
+    ):
+        return set()
+    return _element_id(items[int(inner[0])], key)
+
+
+def _written_elements(tokens: tuple[str, ...], value: Any) -> set[str]:
+    """Return the ids that writing a value at a pointer would bring into existence."""
+    domain, *rest = tokens
+    if not rest:
+        return _domain_ids(value, domain)
+    name, *inner = rest
+    key = _ELEMENT_KEYS[domain].get(name)
+    if key is None:
+        return set()
+    if not inner:
+        return _collection_ids(value, key)
+    if len(inner) == 1:
+        return _element_id(value, key)
+    if inner[1:] == [key] and isinstance(value, str):
+        return {value}
+    return set()
+
+
+def elements_touched(document: dict[str, Any], operation: PatchOperation) -> frozenset[str]:
+    """Return every lock target one operation reads or writes, including ``test`` and ``from``.
+
+    ``document`` must be the working copy as the previous operations left it, because pointers
+    address array positions and those shift during a delta.
+    """
+    tokens = parse_pointer(operation.path)
+    touched = _existing_elements(document, tokens, inserting=operation.op in _INSERTING_OPS)
+    if operation.from_ is not None:
+        source = parse_pointer(operation.from_)
+        touched |= _existing_elements(document, source, inserting=False)
+        touched |= _written_elements(tokens, _resolve(document, source))
+    elif operation.op in _VALUE_WRITING_OPS:
+        touched |= _written_elements(tokens, thaw_json(operation.value))
+    return frozenset(touched)
+
+
+def _diff_collection(
+    before: Mapping[str, BaseModel], after: Mapping[str, BaseModel]
+) -> tuple[set[str], bool]:
+    """Return the ids that were added, removed or edited, and whether survivors changed order."""
+    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    reordered = [key for key in before if key in after] != [key for key in after if key in before]
+    return changed, reordered
+
+
+def changed_elements(
+    before: FullstackProjectBundle, after: FullstackProjectBundle
+) -> frozenset[str]:
+    """Return the lock targets a transition between two bundles touched.
+
+    This compares outcomes by stable id rather than reading patch paths, because pointers address
+    array positions: after ``remove /frontend/components/0``, index 0 names a different component.
+    """
+    components, components_moved = _diff_collection(
+        {node.id: node for node in before.frontend.components},
+        {node.id: node for node in after.frontend.components},
+    )
+    models, models_moved = _diff_collection(
+        {model.name: model for model in before.backend.models},
+        {model.name: model for model in after.backend.models},
+    )
+    endpoints, endpoints_moved = _diff_collection(
+        {endpoint.id: endpoint for endpoint in before.backend.endpoints},
+        {endpoint.id: endpoint for endpoint in after.backend.endpoints},
+    )
+    changed = components | models | endpoints
+
+    frontend_fields = {"components"}
+    if components_moved or before.frontend.model_dump(
+        exclude=frontend_fields
+    ) != after.frontend.model_dump(exclude=frontend_fields):
+        changed.add(FRONTEND_DOCUMENT_LOCK)
+    backend_fields = {"models", "endpoints"}
+    if (
+        models_moved
+        or endpoints_moved
+        or before.backend.model_dump(exclude=backend_fields)
+        != after.backend.model_dump(exclude=backend_fields)
+    ):
+        changed.add(BACKEND_DOCUMENT_LOCK)
+    return frozenset(changed)
+
+
 class PatchEngine:
     """Applies deltas to a private serialized copy of the bundle.
 
@@ -204,9 +351,17 @@ class PatchEngine:
         self._clock = clock
 
     def apply_patch(
-        self, bundle: FullstackProjectBundle, delta: StreamDelta
+        self,
+        bundle: FullstackProjectBundle,
+        delta: StreamDelta,
+        *,
+        authorize: Authorizer = lambda _elements: None,
     ) -> tuple[FullstackProjectBundle, str]:
         """Return the patched bundle and its state hash, or raise ``ASTSyntaxCompilationError``.
+
+        ``authorize`` is given each operation's lock targets before that operation runs, and rejects
+        the delta by raising. It defaults to allowing everything, so a replay of an already
+        authorized log needs no lock state.
 
         ``line_number`` on the error is the 1-based position of the failing operation. Failures
         found after all operations ran report the last position and no ``syntax_token``.
@@ -226,6 +381,7 @@ class PatchEngine:
         for position, (operation, raw) in enumerate(zip(delta.patches, patch, strict=True), 1):
             try:
                 _require_in_domain(operation, delta.target_domain)
+                authorize(elements_touched(document, operation))
                 budget = _apply_operation(document, operation, budget)
             # A chain of nested adds can build a document too deep for recursive traversal.
             except (_PatchFailure, RecursionError) as error:
