@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+"$(dirname "${BASH_SOURCE[0]}")/_policy.sh"
+
+uv run --locked ruff check .
+uv run --locked ruff format --check .

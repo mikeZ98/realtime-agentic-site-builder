@@ -1,0 +1,42 @@
+# Tool caches and artifacts (all routed to .cache/)
+.cache/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Test coverage reports
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+coverage/
+*.lcov
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+.direnv/
+
+# Frontend build artifacts
+.next/
+node_modules/
+out/
+.turbo/
+*.tsbuildinfo
+
+# OS and editors
+.DS_Store
+._*
+.idea/
+.vscode/

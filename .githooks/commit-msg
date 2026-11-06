@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck source=_policy.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_policy.sh"
+
+if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    policy_error "merge commits are not allowed; rebase instead"
+    exit 1
+fi
+
+# Drop comment lines and the `git commit -v` diff, which git would strip after this hook.
+message="$(sed -e '/^# -* >8 -*$/,$d' -e '/^#/d' "$1")"
+policy_check_message "$message"
