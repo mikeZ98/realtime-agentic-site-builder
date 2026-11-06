@@ -19,6 +19,7 @@ from realtime_agentic_site_builder.core.hub import (
     StateEvent,
     SwarmEvent,
     SwarmSessionHub,
+    ThoughtEvent,
     create_event_bus,
     session_channel,
 )
@@ -65,6 +66,7 @@ from realtime_agentic_site_builder.domain.swarm import (
     MAX_LOCK_TIMEOUT_MS,
     AgentCursorFrame,
     AgentRole,
+    AgentThoughtStream,
     ElementLock,
     LockState,
     PatchOperation,
@@ -1414,6 +1416,270 @@ async def test_closing_a_session_wakes_a_blocked_listener() -> None:
     assert await asyncio.wait_for(reader, WAIT_S) is None
 
 
+# --- hub: lossless thoughts ------------------------------------------------------------------
+
+
+def make_thought(text: str = "Thinking", *, agent_id: str = AGENT) -> AgentThoughtStream:
+    return AgentThoughtStream(
+        agent_id=agent_id,
+        role=AgentRole.STYLER,
+        thought=text,
+        tool_name="llm.generate",
+        tool_args={"model": "m"},
+        timestamp_ms=1,
+    )
+
+
+async def drain_thoughts(listener: SessionListener, count: int) -> list[ThoughtEvent]:
+    events = [await next_event(listener) for _ in range(count)]
+    assert all(isinstance(event, ThoughtEvent) for event in events)
+    return cast("list[ThoughtEvent]", events)
+
+
+async def test_thought_reaches_every_listener_with_its_badge() -> None:
+    hub = await make_hub()
+    first, second = hub.subscribe(SESSION), hub.subscribe(SESSION)
+    thought = make_thought()
+
+    returned = await hub.broadcast_thought(SESSION, thought)
+
+    for listener in (first, second):
+        event = await next_event(listener)
+        assert event == returned
+        assert isinstance(event, ThoughtEvent)
+        assert event.thought == thought
+        assert event.session_id == SESSION
+        assert event.seq == 0
+        assert event.thought.tool_name == "llm.generate"
+    await hub.shutdown()
+
+
+async def test_thought_is_delivered_without_waiting_for_the_frame_pump() -> None:
+    gate = asyncio.Event()
+
+    async def never_returns(_seconds: float) -> None:
+        await gate.wait()
+
+    hub = SwarmSessionHub(make_settings(), bus=InMemoryEventBus(), sleep=never_returns)
+    await hub.create_session(SESSION, make_bundle())
+    listener = hub.subscribe(SESSION)
+    await hub.broadcast_frame(SESSION, make_frame())
+    assert isinstance(await next_event(listener), CursorEvent)
+    # The pump is now paused for the frame interval, so a cursor sent now has to wait.
+    await hub.broadcast_frame(SESSION, make_frame(x=2))
+    await hub.broadcast_thought(SESSION, make_thought())
+    # No suspension needed: the thought is already in the listener's buffer.
+    assert listener._thoughts
+    assert not listener._cursors
+    await hub.shutdown()
+
+
+async def test_burst_loses_no_thought_while_cursors_conflate() -> None:
+    hub = await make_hub()
+    listener = hub.subscribe(SESSION)
+    count = 5000
+    for index in range(count):
+        await hub.broadcast_thought(SESSION, make_thought(f"t{index}"))
+        await hub.broadcast_frame(SESSION, make_frame(x=index % 100))
+
+    events = await drain_thoughts(listener, count)
+
+    assert [event.seq for event in events] == list(range(count))
+    assert [event.thought.thought for event in events] == [f"t{i}" for i in range(count)]
+    assert isinstance(await next_event(listener), CursorEvent)
+    await assert_silent(listener)
+    await hub.shutdown()
+
+
+async def test_slow_listener_keeps_every_thought_beyond_the_buffer_capacity() -> None:
+    hub = await make_hub(listener_capacity=2)
+    slow = hub.subscribe(SESSION)
+    for index in range(50):
+        await hub.broadcast_thought(SESSION, make_thought(f"t{index}"))
+    assert slow.dropped == 0
+    assert [event.seq for event in await drain_thoughts(slow, 50)] == list(range(50))
+    await hub.shutdown()
+
+
+async def test_slow_listener_stalls_neither_the_sender_nor_other_listeners() -> None:
+    hub = await make_hub()
+    slow, fast = hub.subscribe(SESSION), hub.subscribe(SESSION)
+    for index in range(10):
+        await hub.broadcast_thought(SESSION, make_thought(f"t{index}"))
+        event = await next_event(fast)
+        assert isinstance(event, ThoughtEvent)
+        assert event.seq == index
+    assert len(slow._thoughts) == 10
+    await hub.shutdown()
+
+
+async def test_state_overflow_cannot_evict_thoughts() -> None:
+    hub = await make_hub(listener_capacity=1)
+    listener = hub.subscribe(SESSION)
+    await hub.broadcast_thought(SESSION, make_thought("kept"))
+    for seq in range(3):
+        await commit(hub, set_code(f"<Hero v{seq} />", seq=seq))
+    assert listener.dropped == 2
+    assert isinstance(await next_event(listener), StateEvent)
+    event = await next_event(listener)
+    assert isinstance(event, ThoughtEvent)
+    assert event.thought.thought == "kept"
+    await hub.shutdown()
+
+
+async def test_thoughts_come_after_state_and_before_cursors() -> None:
+    hub = await make_hub()
+    listener = hub.subscribe(SESSION)
+    listener.offer(CursorEvent(origin="w", session_id=SESSION, frame=make_frame()))
+    await hub.broadcast_thought(SESSION, make_thought())
+    await commit(hub, set_code("<Hero v2 />"))
+    kinds = [(await next_event(listener)).kind for _ in range(3)]
+    assert kinds == ["state", "thought", "cursor"]
+    await hub.shutdown()
+
+
+async def test_thoughts_survive_listener_and_session_close() -> None:
+    hub = await make_hub()
+    closed_early, closed_by_session = hub.subscribe(SESSION), hub.subscribe(SESSION)
+    await hub.broadcast_thought(SESSION, make_thought("before"))
+    closed_early.close()
+    await hub.broadcast_thought(SESSION, make_thought("after"))
+    await hub.close_session(SESSION)
+
+    assert [e.seq async for e in closed_early if isinstance(e, ThoughtEvent)] == [0]
+    assert [e.seq async for e in closed_by_session if isinstance(e, ThoughtEvent)] == [0, 1]
+
+
+async def test_thought_sequence_is_per_session() -> None:
+    hub = await make_hub()
+    await hub.create_session("session-2", make_bundle())
+    await hub.broadcast_thought(SESSION, make_thought())
+    await hub.broadcast_thought(SESSION, make_thought())
+    assert (await hub.broadcast_thought("session-2", make_thought())).seq == 0
+    assert (await hub.broadcast_thought(SESSION, make_thought())).seq == 2
+    await hub.shutdown()
+
+
+async def test_thought_for_an_unknown_session_is_rejected() -> None:
+    hub = await make_hub()
+    with pytest.raises(SessionNotFoundError):
+        await hub.broadcast_thought("missing", make_thought())
+    await hub.shutdown()
+
+
+async def test_thoughts_count_as_session_activity() -> None:
+    clock = FakeClock(0)
+    hub = await make_hub(clock=clock, session_ttl_seconds=10)
+    clock.now = 9_000
+    await hub.broadcast_thought(SESSION, make_thought())
+    assert await hub.sweep(now_ms=10_000) == ()
+    assert await hub.sweep(now_ms=19_000) == (SESSION,)
+    await hub.shutdown()
+
+
+async def test_thoughts_replicate_in_order_exactly_once() -> None:
+    bus = InMemoryEventBus()
+    writer, replica = await make_hub(bus=bus), await make_hub(bus=bus)
+    local, remote = writer.subscribe(SESSION), replica.subscribe(SESSION)
+    for index in range(20):
+        await writer.broadcast_thought(SESSION, make_thought(f"t{index}"))
+
+    assert [e.seq for e in await drain_thoughts(remote, 20)] == list(range(20))
+    assert [e.seq for e in await drain_thoughts(local, 20)] == list(range(20))
+    await assert_silent(remote)
+    await assert_silent(local)
+    await writer.shutdown()
+    await replica.shutdown()
+
+
+async def test_replica_outbox_does_not_drop_thoughts_past_the_notice_capacity() -> None:
+    bus = InMemoryEventBus()
+    writer = await make_hub(bus=bus, listener_capacity=2)
+    replica = await make_hub(bus=bus)
+    remote = replica.subscribe(SESSION)
+    for index in range(100):
+        await writer.broadcast_thought(SESSION, make_thought(f"t{index}"))
+    assert [e.seq for e in await drain_thoughts(remote, 100)] == list(range(100))
+    await writer.shutdown()
+    await replica.shutdown()
+
+
+async def test_replica_discards_a_repeated_thought_and_keeps_later_ones() -> None:
+    bus = InMemoryEventBus()
+    hub = await make_hub(bus=bus)
+    listener = hub.subscribe(SESSION)
+    channel = session_channel(SESSION)
+    first = ThoughtEvent(origin="other", session_id=SESSION, seq=4, thought=make_thought())
+    later = first.model_copy(update={"seq": 5})
+
+    await bus.publish(channel, first)
+    await bus.publish(channel, first)
+    await bus.publish(channel, later)
+
+    assert [e.seq for e in await drain_thoughts(listener, 2)] == [4, 5]
+    await assert_silent(listener)
+    # A replica that takes over writing continues the same sequence.
+    assert (await hub.broadcast_thought(SESSION, make_thought())).seq == 6
+    await hub.shutdown()
+
+
+async def test_replica_ignores_a_thought_for_another_session() -> None:
+    bus = InMemoryEventBus()
+    hub = await make_hub(bus=bus)
+    listener = hub.subscribe(SESSION)
+    event = ThoughtEvent(origin="other", session_id="elsewhere", seq=0, thought=make_thought())
+    await bus.publish(session_channel(SESSION), event)
+    await assert_silent(listener)
+    await hub.shutdown()
+
+
+async def test_thoughts_still_queued_at_close_reach_other_workers() -> None:
+    bus = InMemoryEventBus()
+    paused = asyncio.Event()
+
+    async def never_returns(_seconds: float) -> None:
+        await paused.wait()
+
+    writer = SwarmSessionHub(make_settings(), bus=bus, sleep=never_returns)
+    await writer.create_session(SESSION, make_bundle())
+    replica = await make_hub(bus=bus)
+    remote = replica.subscribe(SESSION)
+    # Leaves the pump asleep, so the next thoughts cannot be flushed by it.
+    await writer.broadcast_thought(SESSION, make_thought("flushed by the pump"))
+    await next_event(remote)
+    for index in range(3):
+        await writer.broadcast_thought(SESSION, make_thought(f"t{index}"))
+    await assert_silent(remote)
+
+    await writer.close_session(SESSION)
+
+    assert [e.seq for e in await drain_thoughts(remote, 3)] == [1, 2, 3]
+    await replica.shutdown()
+
+
+async def test_publish_cancelled_midway_keeps_the_thought_for_the_close_flush() -> None:
+    delivered: list[int] = []
+    hang = asyncio.Event()
+
+    class HangsOnce(InMemoryEventBus):
+        async def publish(self, channel: str, event: SwarmEvent) -> None:
+            assert isinstance(event, ThoughtEvent)
+            if not hang.is_set():
+                hang.set()
+                await asyncio.Event().wait()
+            delivered.append(event.seq)
+            await super().publish(channel, event)
+
+    hub = await make_hub(bus=HangsOnce())
+    await hub.broadcast_thought(SESSION, make_thought())
+    await asyncio.wait_for(hang.wait(), WAIT_S)
+    await hub.broadcast_thought(SESSION, make_thought())
+
+    await hub.close_session(SESSION)
+
+    assert delivered == [0, 1]
+
+
 # --- hub: deltas and timeline ---------------------------------------------------------------
 
 
@@ -2569,6 +2835,40 @@ async def test_redis_bus_carries_cursor_and_lock_events() -> None:
     await replica.shutdown()
     await bus_a.close()
     await bus_b.close()
+
+
+async def test_redis_bus_carries_thoughts_through_json_with_their_badges() -> None:
+    broker = FakeBroker()
+    bus_a, _ = make_redis_bus(broker)
+    bus_b, _ = make_redis_bus(broker)
+    writer, replica = await make_hub(bus=bus_a), await make_hub(bus=bus_b)
+    remote = replica.subscribe(SESSION)
+    thought = make_thought()
+
+    await writer.broadcast_thought(SESSION, thought)
+
+    event = await next_event(remote)
+    assert isinstance(event, ThoughtEvent)
+    assert event.seq == 0
+    assert event.thought == thought
+    assert event.thought.tool_args == {"model": "m"}
+    await writer.shutdown()
+    await replica.shutdown()
+    await bus_a.close()
+    await bus_b.close()
+
+
+async def test_local_thoughts_survive_a_redis_outage() -> None:
+    broker = FakeBroker()
+    bus, _ = make_redis_bus(broker)
+    hub = await make_hub(bus=bus)
+    listener = hub.subscribe(SESSION)
+    broker.fail_publish = True
+    for index in range(5):
+        await hub.broadcast_thought(SESSION, make_thought(f"t{index}"))
+    assert [e.seq for e in await drain_thoughts(listener, 5)] == list(range(5))
+    await hub.shutdown()
+    await bus.close()
 
 
 async def test_redis_bus_discards_invalid_messages_and_keeps_reading(

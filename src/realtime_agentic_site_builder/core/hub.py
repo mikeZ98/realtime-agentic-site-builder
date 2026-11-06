@@ -25,7 +25,7 @@ from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
 from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager, LockEvent
 from realtime_agentic_site_builder.core.patch_engine import PatchEngine, changed_elements
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
-from realtime_agentic_site_builder.domain.base import DomainModel, Identifier
+from realtime_agentic_site_builder.domain.base import DomainModel, Identifier, NonNegativeInt
 from realtime_agentic_site_builder.domain.errors import (
     DeltaRejectedError,
     ElementLockConflictError,
@@ -36,6 +36,7 @@ from realtime_agentic_site_builder.domain.errors import (
 )
 from realtime_agentic_site_builder.domain.swarm import (
     AgentCursorFrame,
+    AgentThoughtStream,
     ReplayTimeline,
     StreamDelta,
     SwarmSnapshot,
@@ -83,7 +84,21 @@ class LockNotice(DomainModel):
     event: LockEvent
 
 
-SwarmEvent = CursorEvent | StateEvent | LockNotice
+class ThoughtEvent(DomainModel):
+    """One agent thought or tool call, which unlike a cursor frame is never conflated away.
+
+    A local listener receives every one. Pub/Sub is at-most-once, so between workers ``seq`` is what
+    lets a receiver notice a gap. It counts per session, and a replica discards what it already saw.
+    """
+
+    kind: Literal["thought"] = "thought"
+    origin: Identifier
+    session_id: Identifier
+    seq: NonNegativeInt
+    thought: AgentThoughtStream
+
+
+SwarmEvent = CursorEvent | StateEvent | LockNotice | ThoughtEvent
 BusHandler = Callable[[SwarmEvent], None]
 
 _EVENT_ADAPTER: Final[TypeAdapter[SwarmEvent]] = TypeAdapter(
@@ -254,12 +269,16 @@ class SessionListener:
 
     Cursor frames are ephemeral, so only the latest per agent is kept. State and lock events wait in
     a bounded queue that drops the oldest on overflow. That is safe for state, because every state
-    event carries the full bundle. They are delivered ahead of cursors, and ``dropped`` counts what
-    this listener missed.
+    event carries the full bundle. ``dropped`` counts what those two lanes lost.
+
+    Thoughts have no such substitute, so their lane has no bound. A stalled listener therefore costs
+    memory instead of data, until it closes or its session does. The lane only holds references to
+    events every listener shares. Delivery order is state and locks, then thoughts, then cursors.
     """
 
     def __init__(self, capacity: int, on_close: Callable[["SessionListener"], None]) -> None:
         self._events: deque[StateEvent | LockNotice] = deque(maxlen=capacity)
+        self._thoughts: deque[ThoughtEvent] = deque()
         self._cursors: dict[str, CursorEvent] = {}
         self._wakeup = asyncio.Event()
         self._on_close = on_close
@@ -270,6 +289,8 @@ class SessionListener:
         if isinstance(event, CursorEvent):
             self.dropped += event.frame.agent_id in self._cursors
             self._cursors[event.frame.agent_id] = event
+        elif isinstance(event, ThoughtEvent):
+            self._thoughts.append(event)
         else:
             self.dropped += len(self._events) == self._events.maxlen
             self._events.append(event)
@@ -285,13 +306,15 @@ class SessionListener:
         return self
 
     async def __anext__(self) -> SwarmEvent:
-        while not self._events and not self._cursors:
+        while not self._events and not self._thoughts and not self._cursors:
             if self._closed:
                 raise StopAsyncIteration
             self._wakeup.clear()
             await self._wakeup.wait()
         if self._events:
             return self._events.popleft()
+        if self._thoughts:
+            return self._thoughts.popleft()
         return self._cursors.pop(next(iter(self._cursors)))
 
 
@@ -323,6 +346,9 @@ class _Session:
         self.reserved_delta_seq = -1
         self.pending_frames: dict[str, AgentCursorFrame] = {}
         self.pending_notices: deque[LockNotice] = deque(maxlen=capacity)
+        # Unbounded unlike the notices: anything dropped here is lost to every other worker.
+        self.pending_thoughts: deque[ThoughtEvent] = deque()
+        self.next_thought_seq = 0
         self.outbox_ready = asyncio.Event()
 
     @property
@@ -443,6 +469,7 @@ class SwarmSessionHub:
         """End a session once in-flight deltas finish, and return its complete replay log."""
         async with self._exclusive(session_id) as session:
             handler = await self._discard(session)
+            await self._flush_thoughts(session)
             await self._bus.unsubscribe(session_channel(session_id), handler)
             return session.timeline()
 
@@ -461,6 +488,25 @@ class SwarmSessionHub:
         session.agents[frame.agent_id] = frame
         session.pending_frames[frame.agent_id] = frame
         session.outbox_ready.set()
+
+    async def broadcast_thought(self, session_id: str, thought: AgentThoughtStream) -> ThoughtEvent:
+        """Deliver a thought to every local listener now, and queue it for other workers.
+
+        Nothing suspends here, so concurrent agents' thoughts get their ``seq`` in delivery order.
+        """
+        session = self._require(session_id)
+        session.last_activity_ms = self._clock()
+        event = ThoughtEvent(
+            origin=self._origin,
+            session_id=session_id,
+            seq=session.next_thought_seq,
+            thought=thought,
+        )
+        session.next_thought_seq += 1
+        session.fan_out(event)
+        session.pending_thoughts.append(event)
+        session.outbox_ready.set()
+        return event
 
     async def apply_delta(self, session_id: str, delta: StreamDelta) -> SwarmSnapshot:
         """Commit a delta, record it for replay and announce the new state.
@@ -596,6 +642,7 @@ class SwarmSessionHub:
         while True:
             await session.outbox_ready.wait()
             session.outbox_ready.clear()
+            await self._flush_thoughts(session)
             frames, session.pending_frames = session.pending_frames, {}
             cursors = [
                 CursorEvent(origin=self._origin, session_id=session.session_id, frame=frame)
@@ -610,12 +657,27 @@ class SwarmSessionHub:
                 await self._bus.publish(channel, event)
             await self._sleep(interval_s)
 
+    async def _flush_thoughts(self, session: _Session) -> None:
+        """Publish queued thoughts in order, removing each only after its publish returns.
+
+        Being cancelled mid-publish leaves that thought queued for the flush on close. The worst
+        case is a repeat, which the receiver discards by ``seq``, rather than a loss.
+        """
+        channel = session_channel(session.session_id)
+        while session.pending_thoughts:
+            await self._bus.publish(channel, session.pending_thoughts[0])
+            session.pending_thoughts.popleft()
+
     def _on_bus_event(self, session: _Session, event: SwarmEvent) -> None:
         if event.origin == self._origin or event.session_id != session.session_id:
             return
         session.last_activity_ms = self._clock()
         if isinstance(event, CursorEvent):
             session.agents[event.frame.agent_id] = event.frame
+        elif isinstance(event, ThoughtEvent):
+            if event.seq < session.next_thought_seq:
+                return
+            session.next_thought_seq = event.seq + 1
         elif isinstance(event, StateEvent) and not self._adopt(session, event):
             return
         session.fan_out(event)

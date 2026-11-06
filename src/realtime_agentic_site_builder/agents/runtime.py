@@ -238,9 +238,14 @@ class NodeContext:
         target_id: str | None = None,
         lock: ElementLock | None = None,
     ) -> None:
-        """Publish a thought, with any tool badge, on this agent's cursor frame."""
+        """Publish a thought with any tool badge, then move this agent's cursor to match.
+
+        The thought goes on the lossless channel. The frame repeats it only as the caption for a
+        cursor, and frames conflate, so consumers wanting the full stream read ``ThoughtEvent``.
+        """
         thought = self._thought(text, tool_name, tool_args, tokens_used, latency_ms)
         self.thoughts.append(thought)
+        await self.runtime.hub.broadcast_thought(self.session_id, thought)
         x, y = self._cursor_for(target_id)
         frame = AgentCursorFrame(
             agent_id=self.identity.agent_id,

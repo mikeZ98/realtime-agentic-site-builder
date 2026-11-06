@@ -55,6 +55,7 @@ from realtime_agentic_site_builder.core.hub import (
     CursorEvent,
     InMemoryEventBus,
     SwarmSessionHub,
+    ThoughtEvent,
 )
 from realtime_agentic_site_builder.core.patch_engine import (
     BACKEND_DOCUMENT_LOCK,
@@ -84,6 +85,7 @@ from realtime_agentic_site_builder.domain.swarm import (
     AgentAction,
     AgentCursorFrame,
     AgentRole,
+    AgentThoughtStream,
     ElementLock,
     LockState,
     StreamDelta,
@@ -114,10 +116,16 @@ class RecordingHub(SwarmSessionHub):
         super().__init__(*args, **kwargs)
         self.frames: list[AgentCursorFrame] = []
         self.commits: list[tuple[StreamDelta, str | None]] = []
+        self.thought_events: list[ThoughtEvent] = []
 
     async def broadcast_frame(self, session_id: str, frame: AgentCursorFrame) -> None:
         self.frames.append(frame)
         await super().broadcast_frame(session_id, frame)
+
+    async def broadcast_thought(self, session_id: str, thought: AgentThoughtStream) -> ThoughtEvent:
+        event = await super().broadcast_thought(session_id, thought)
+        self.thought_events.append(event)
+        return event
 
     async def apply_delta(self, session_id: str, delta: StreamDelta) -> SwarmSnapshot:
         holder = self.lock_manager(session_id).live_holder(delta.target_id, self.now_ms())
@@ -1688,6 +1696,60 @@ async def test_frames_identify_their_agent_and_track_the_element_in_hand() -> No
     assert editing
     assert all(f.y > 0 for f in editing), "the cursor should sit on the component being written"
     assert all(f.active_lock is not None for f in editing)
+    await hub.shutdown()
+
+
+async def drain_run(listener: Any) -> list[Any]:
+    received: list[Any] = []
+    while True:
+        try:
+            received.append(await asyncio.wait_for(anext(listener), 0.2))
+        except TimeoutError:
+            return received
+
+
+async def test_listener_receives_every_thought_and_badge_of_a_run() -> None:
+    """Agents emit in bursts with no suspension, which is exactly what frames conflate away."""
+    hub = await make_hub()
+    listener = hub.subscribe(SESSION)
+    state = await run_swarm(hub, MockLLMProvider())
+
+    events = [e for e in await drain_run(listener) if isinstance(e, ThoughtEvent)]
+
+    assert [event.seq for event in events] == list(range(len(events)))
+    assert sorted((event.thought.agent_id, event.thought.thought) for event in events) == sorted(
+        (thought.agent_id, thought.thought) for thought in state["agent_thoughts"]
+    )
+    badges = {event.thought.tool_name for event in events}
+    assert {
+        "graph.enter",
+        "graph.exit",
+        "lock.acquire",
+        "llm.generate",
+        "hub.apply_delta",
+        "critic.verdict",
+    } <= badges
+    await hub.shutdown()
+
+
+async def test_conflated_frames_would_have_lost_what_thought_events_deliver() -> None:
+    hub = await make_hub()
+    listener = hub.subscribe(SESSION)
+    await run_swarm(hub, MockLLMProvider())
+    received = await drain_run(listener)
+    thoughts = [e for e in received if isinstance(e, ThoughtEvent)]
+    cursors = [e for e in received if isinstance(e, CursorEvent)]
+    assert len(cursors) < len(hub.frames), "frames are expected to conflate"
+    assert len(thoughts) == len(hub.frames), "no thought may be lost"
+    await hub.shutdown()
+
+
+async def test_thought_precedes_its_cursor_frame() -> None:
+    hub = await make_hub()
+    await run_swarm(hub, MockLLMProvider())
+    assert len(hub.thought_events) == len(hub.frames)
+    for event, frame in zip(hub.thought_events, hub.frames, strict=True):
+        assert frame.current_thought == event.thought
     await hub.shutdown()
 
 
