@@ -15,6 +15,7 @@ from realtime_agentic_site_builder.agents.graph import (
     create_swarm_graph,
     route_after_critic,
 )
+from realtime_agentic_site_builder.agents.identity import IDENTITIES
 from realtime_agentic_site_builder.agents.nodes import backend_node, coder_node, critic_node
 from realtime_agentic_site_builder.agents.provider import (
     MAX_VALIDATION_ATTEMPTS,
@@ -29,7 +30,6 @@ from realtime_agentic_site_builder.agents.provider import (
     TokenUsage,
 )
 from realtime_agentic_site_builder.agents.runtime import (
-    IDENTITIES,
     LOCK_POLL_S,
     NodeContext,
     SwarmRuntime,
@@ -118,9 +118,11 @@ class RecordingHub(SwarmSessionHub):
         self.commits: list[tuple[StreamDelta, str | None]] = []
         self.thought_events: list[ThoughtEvent] = []
 
-    async def broadcast_frame(self, session_id: str, frame: AgentCursorFrame) -> None:
+    async def broadcast_frame(
+        self, session_id: str, frame: AgentCursorFrame, *, touch: bool = True
+    ) -> None:
         self.frames.append(frame)
-        await super().broadcast_frame(session_id, frame)
+        await super().broadcast_frame(session_id, frame, touch=touch)
 
     async def broadcast_thought(self, session_id: str, thought: AgentThoughtStream) -> ThoughtEvent:
         event = await super().broadcast_thought(session_id, thought)
@@ -983,10 +985,10 @@ async def test_coder_and_backend_contend_for_a_form_without_losing_either_write(
 
     original = hub.broadcast_frame
 
-    async def watch(session_id: str, frame: AgentCursorFrame) -> None:
+    async def watch(session_id: str, frame: AgentCursorFrame, *, touch: bool = True) -> None:
         if frame.current_action is AgentAction.BLOCKED_WAITING:
             backend_blocked.set()
-        await original(session_id, frame)
+        await original(session_id, frame, touch=touch)
 
     hub.broadcast_frame = watch  # type: ignore[method-assign]
     state = await run_swarm(hub, HookedProvider(MockLLMProvider(), force_contention))

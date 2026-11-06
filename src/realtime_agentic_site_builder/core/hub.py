@@ -481,10 +481,17 @@ class SwarmSessionHub:
         if self._owns_bus:
             await self._bus.close()
 
-    async def broadcast_frame(self, session_id: str, frame: AgentCursorFrame) -> None:
-        """Queue a cursor update for the session's frame pump, without waiting for any consumer."""
+    async def broadcast_frame(
+        self, session_id: str, frame: AgentCursorFrame, *, touch: bool = True
+    ) -> None:
+        """Queue a cursor update for the session's frame pump, without waiting for any consumer.
+
+        Pass ``touch=False`` for frames nobody acted to produce, such as a simulator's idle drift.
+        Those must not keep an otherwise abandoned session from expiring.
+        """
         session = self._require(session_id)
-        session.last_activity_ms = self._clock()
+        if touch:
+            session.last_activity_ms = self._clock()
         session.agents[frame.agent_id] = frame
         session.pending_frames[frame.agent_id] = frame
         session.outbox_ready.set()
@@ -671,7 +678,10 @@ class SwarmSessionHub:
     def _on_bus_event(self, session: _Session, event: SwarmEvent) -> None:
         if event.origin == self._origin or event.session_id != session.session_id:
             return
-        session.last_activity_ms = self._clock()
+        # A replica cannot tell a real frame from idle drift, so no cursor counts. Real work always
+        # shows up as thoughts and state, and two ticking workers would otherwise never expire.
+        if not isinstance(event, CursorEvent):
+            session.last_activity_ms = self._clock()
         if isinstance(event, CursorEvent):
             session.agents[event.frame.agent_id] = event.frame
         elif isinstance(event, ThoughtEvent):

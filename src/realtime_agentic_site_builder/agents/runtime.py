@@ -3,12 +3,12 @@
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Final, Self
+from typing import Any, Final, Protocol, Self
 
 from pydantic import TypeAdapter, ValidationError
 
+from realtime_agentic_site_builder.agents.identity import IDENTITIES
 from realtime_agentic_site_builder.agents.provider import (
     LLMProvider,
     LLMRequest,
@@ -19,7 +19,7 @@ from realtime_agentic_site_builder.agents.state import AgentWorkflowState
 from realtime_agentic_site_builder.core.hub import SwarmSessionHub
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
 from realtime_agentic_site_builder.domain.base import MAX_TEXT_LENGTH
-from realtime_agentic_site_builder.domain.blueprint import ComponentNode
+from realtime_agentic_site_builder.domain.blueprint import BoundingBox, ComponentNode
 from realtime_agentic_site_builder.domain.errors import (
     ASTSyntaxCompilationError,
     ElementLockConflictError,
@@ -43,28 +43,15 @@ RENEWALS_PER_LEASE: Final = 3
 WIREFRAME_PREFIX: Final = "/* wireframe */"
 _DELTA: Final = TypeAdapter(StreamDelta)
 
-# A later role's work builds on an earlier one's, so the earlier role wins a deadlock.
-_IDENTITY_ROWS: Final = (
-    (AgentRole.ARCHITECT, "agent-architect", "Architect", "#7c3aed", 90),
-    (AgentRole.BACKEND_ENGINEER, "agent-backend", "Backend Engineer", "#059669", 70),
-    (AgentRole.FRONTEND_CODER, "agent-coder", "Frontend Coder", "#2563eb", 60),
-    (AgentRole.STYLER, "agent-styler", "Styler", "#db2777", 40),
-    (AgentRole.CRITIC_LINTER, "agent-critic", "Critic", "#d97706", 30),
-)
 
+class CursorDirector(Protocol):
+    """Takes over cursor positions, so that the agents' frames are read as intent rather than drawn.
 
-@dataclass(frozen=True, slots=True)
-class AgentIdentity:
-    role: AgentRole
-    agent_id: str
-    name: str
-    color: str
-    priority: int
+    Without one, agents publish their frames straight to the hub, with the cursor at the box center.
+    With one, it is the only writer of cursor frames, which keeps two sources from fighting.
+    """
 
-
-IDENTITIES: Final[Mapping[AgentRole, AgentIdentity]] = {
-    row[0]: AgentIdentity(*row) for row in _IDENTITY_ROWS
-}
+    def direct(self, frame: AgentCursorFrame, box: BoundingBox | None) -> None: ...
 
 
 def wireframe_code(component_id: str) -> str:
@@ -86,10 +73,12 @@ class SwarmRuntime:
         provider: LLMProvider,
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        cursors: CursorDirector | None = None,
     ) -> None:
         self.hub = hub
         self.provider = provider
         self.sleep = sleep
+        self.cursors = cursors
 
 
 class LockScope:
@@ -161,6 +150,8 @@ class LockScope:
                     f"Waiting for the lock on {target_id}.",
                     tool_name="lock.wait",
                     tool_args={"target_id": target_id},
+                    target_id=target_id,
+                    lock=lock,
                 )
             await self._context.runtime.sleep(LOCK_POLL_S)
 
@@ -246,26 +237,28 @@ class NodeContext:
         thought = self._thought(text, tool_name, tool_args, tokens_used, latency_ms)
         self.thoughts.append(thought)
         await self.runtime.hub.broadcast_thought(self.session_id, thought)
-        x, y = self._cursor_for(target_id)
+        box = self._box_of(target_id)
         frame = AgentCursorFrame(
             agent_id=self.identity.agent_id,
             name=self.identity.name,
             role=self.identity.role,
             color=self.identity.color,
-            x=x,
-            y=y,
+            x=box.x + box.width // 2 if box is not None else 0,
+            y=box.y + box.height // 2 if box is not None else 0,
             current_action=action,
             current_thought=thought,
             active_lock=lock,
         )
-        await self.runtime.hub.broadcast_frame(self.session_id, frame)
+        if self.runtime.cursors is not None:
+            self.runtime.cursors.direct(frame, box)
+        else:
+            await self.runtime.hub.broadcast_frame(self.session_id, frame)
 
-    def _cursor_for(self, target_id: str | None) -> tuple[int, int]:
+    def _box_of(self, target_id: str | None) -> BoundingBox | None:
         for component in self.bundle().frontend.components:
             if component.id == target_id:
-                box = component.box
-                return box.x + box.width // 2, box.y + box.height // 2
-        return 0, 0
+                return component.box
+        return None
 
     async def generate[T: AgentOutput](
         self, system: str, prompt: str, schema: type[T], *, target_id: str | None = None

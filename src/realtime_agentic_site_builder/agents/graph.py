@@ -16,7 +16,11 @@ from realtime_agentic_site_builder.agents.nodes import (
     styler_node,
 )
 from realtime_agentic_site_builder.agents.provider import LLMProvider
-from realtime_agentic_site_builder.agents.runtime import NodeContext, SwarmRuntime
+from realtime_agentic_site_builder.agents.runtime import (
+    CursorDirector,
+    NodeContext,
+    SwarmRuntime,
+)
 from realtime_agentic_site_builder.agents.state import AgentWorkflowState
 from realtime_agentic_site_builder.core.hub import SwarmSessionHub
 from realtime_agentic_site_builder.domain.errors import SessionNotFoundError
@@ -94,14 +98,16 @@ def create_swarm_graph(
     llm_provider: LLMProvider,
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    cursors: CursorDirector | None = None,
 ) -> SwarmGraph:
     """Build the planner -> (coder || backend) -> styler -> critic loop.
 
     Coder and backend share one step, and both have a plain edge to the styler, which therefore runs
     once whether one or both of them were scheduled. A join edge would wait forever on a retry that
-    only needs one. The session must already exist on the hub.
+    only needs one. The session must already exist on the hub. Pass ``cursors`` to have a
+    simulator move the agents' cursors, with a ticker running against the same session.
     """
-    runtime = SwarmRuntime(hub, llm_provider, sleep=sleep)
+    runtime = SwarmRuntime(hub, llm_provider, sleep=sleep, cursors=cursors)
     builder = StateGraph(AgentWorkflowState)
     builder.add_node(PLANNER, _instrument(runtime, PLANNER, AgentRole.ARCHITECT, planner_node))
     builder.add_node(
