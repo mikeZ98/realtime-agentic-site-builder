@@ -39,6 +39,19 @@ class Settings(BaseSettings):
     agent_max_iterations: int = Field(default=3, ge=1, le=20)
     agent_lock_wait_ms: int = Field(default=120_000, ge=1)
 
+    # Signs client tokens. The gateway refuses to start without it: `prompt` spends real money.
+    gateway_secret: SecretStr | None = Field(default=None, min_length=32)
+    gateway_sweep_interval_seconds: float = Field(default=1.0, gt=0)
+    gateway_drain_timeout_seconds: float = Field(default=5.0, gt=0)
+    gateway_max_sessions: int = Field(default=1000, ge=1)
+    gateway_max_concurrent_runs: int = Field(default=8, ge=1)
+    max_request_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
+    thought_backlog_size: int = Field(default=1000, ge=1)
+    ws_catchup_deadline_ms: int = Field(default=5000, ge=1)
+    ws_heartbeat_timeout_seconds: float = Field(default=60.0, gt=0)
+    ws_max_message_bytes: int = Field(default=128 * 1024, ge=1)
+    ws_max_messages_per_second: int = Field(default=120, ge=1)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -245,6 +245,36 @@ class LLMConfigurationError(SiteBuilderError):
     slug: ClassVar[str] = "llm-configuration-failure"
 
 
+class AuthenticationRequiredError(SiteBuilderError):
+    status: ClassVar[int] = 401
+    title: ClassVar[str] = "Authentication required"
+    slug: ClassVar[str] = "authentication-required"
+
+
+class PermissionDeniedError(SiteBuilderError):
+    status: ClassVar[int] = 403
+    title: ClassVar[str] = "Permission denied"
+    slug: ClassVar[str] = "permission-denied"
+
+
+class RunAlreadyActiveError(SiteBuilderError):
+    status: ClassVar[int] = 409
+    title: ClassVar[str] = "Run already active"
+    slug: ClassVar[str] = "run-already-active"
+
+
+class CapacityExceededError(SiteBuilderError):
+    status: ClassVar[int] = 429
+    title: ClassVar[str] = "Capacity exceeded"
+    slug: ClassVar[str] = "capacity-exceeded"
+
+
+class GatewayConfigurationError(SiteBuilderError):
+    status: ClassVar[int] = 500
+    title: ClassVar[str] = "Gateway configuration failure"
+    slug: ClassVar[str] = "gateway-configuration-failure"
+
+
 def element_resource_uri(target_id: str) -> str:
     """Return the URI identifying a lockable element in conflict diagnostics."""
     return f"urn:site-builder:element:{quote(target_id, safe='')}"

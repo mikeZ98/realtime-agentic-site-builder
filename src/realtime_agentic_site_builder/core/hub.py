@@ -13,10 +13,11 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from typing import Annotated, Any, Final, Literal, Protocol, Self, cast
 
-from pydantic import Field, TypeAdapter, ValidationError, model_validator
+from pydantic import Field, StrictBool, TypeAdapter, ValidationError, model_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -40,6 +41,8 @@ from realtime_agentic_site_builder.domain.swarm import (
     ReplayTimeline,
     StreamDelta,
     SwarmSnapshot,
+    ViewportX,
+    ViewportY,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,13 +101,37 @@ class ThoughtEvent(DomainModel):
     thought: AgentThoughtStream
 
 
-SwarmEvent = CursorEvent | StateEvent | LockNotice | ThoughtEvent
+class PresenceEvent(DomainModel):
+    """Where a person is and what they have selected. People are not agents: they have no role and
+    do not belong in a snapshot's ``active_agents``. Conflatable, like an agent's cursor.
+    """
+
+    kind: Literal["presence"] = "presence"
+    origin: Identifier
+    session_id: Identifier
+    user_id: Identifier
+    x: ViewportX = 0
+    y: ViewportY = 0
+    selected_id: Identifier | None = None
+    active: StrictBool = True
+
+
+SwarmEvent = CursorEvent | StateEvent | LockNotice | ThoughtEvent | PresenceEvent
 BusHandler = Callable[[SwarmEvent], None]
 
 _EVENT_ADAPTER: Final[TypeAdapter[SwarmEvent]] = TypeAdapter(
     Annotated[SwarmEvent, Field(discriminator="kind")]
 )
 _SESSION_ID: Final = TypeAdapter(Identifier)
+
+
+@dataclass(frozen=True, slots=True)
+class ThoughtBacklog:
+    """Retained thoughts for a reader. ``gap`` means some it asked for are gone for good."""
+
+    events: tuple[ThoughtEvent, ...]
+    gap: bool
+    latest_seq: int | None
 
 
 def session_channel(session_id: str) -> str:
@@ -276,19 +303,23 @@ class SessionListener:
     events every listener shares. Delivery order is state and locks, then thoughts, then cursors.
     """
 
-    def __init__(self, capacity: int, on_close: Callable[["SessionListener"], None]) -> None:
+    def __init__(self, capacity: int | None, on_close: Callable[["SessionListener"], None]) -> None:
+        # No capacity means nothing is dropped, for a consumer that evicts its slow readers instead.
         self._events: deque[StateEvent | LockNotice] = deque(maxlen=capacity)
         self._thoughts: deque[ThoughtEvent] = deque()
-        self._cursors: dict[str, CursorEvent] = {}
+        self._cursors: dict[str, CursorEvent | PresenceEvent] = {}
         self._wakeup = asyncio.Event()
         self._on_close = on_close
         self._closed = False
         self.dropped = 0
 
     def offer(self, event: SwarmEvent) -> None:
-        if isinstance(event, CursorEvent):
-            self.dropped += event.frame.agent_id in self._cursors
-            self._cursors[event.frame.agent_id] = event
+        if isinstance(event, CursorEvent | PresenceEvent):
+            key = (
+                event.frame.agent_id if isinstance(event, CursorEvent) else f"user:{event.user_id}"
+            )
+            self.dropped += key in self._cursors
+            self._cursors[key] = event
         elif isinstance(event, ThoughtEvent):
             self._thoughts.append(event)
         else:
@@ -306,16 +337,38 @@ class SessionListener:
         return self
 
     async def __anext__(self) -> SwarmEvent:
-        while not self._events and not self._thoughts and not self._cursors:
+        while (event := self.poll()) is None:
             if self._closed:
                 raise StopAsyncIteration
-            self._wakeup.clear()
-            await self._wakeup.wait()
+            await self.wait()
+        return event
+
+    def poll(self) -> SwarmEvent | None:
+        """Take the next buffered event without waiting, for consumers merging other sources."""
         if self._events:
             return self._events.popleft()
         if self._thoughts:
             return self._thoughts.popleft()
-        return self._cursors.pop(next(iter(self._cursors)))
+        if self._cursors:
+            return self._cursors.pop(next(iter(self._cursors)))
+        return None
+
+    async def wait(self) -> None:
+        """Sleep until something is offered, the listener closes, or ``wake`` is called."""
+        self._wakeup.clear()
+        await self._wakeup.wait()
+
+    def wake(self) -> None:
+        self._wakeup.set()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def lossless_pending(self) -> int:
+        """Count buffered events that must reach the reader, which excludes conflatable cursors."""
+        return len(self._events) + len(self._thoughts)
 
 
 class _Session:
@@ -330,6 +383,7 @@ class _Session:
         lease_ms: int,
         clock: Clock,
         capacity: int,
+        backlog: int,
         now_ms: int,
     ) -> None:
         self.session_id = session_id
@@ -348,7 +402,9 @@ class _Session:
         self.pending_notices: deque[LockNotice] = deque(maxlen=capacity)
         # Unbounded unlike the notices: anything dropped here is lost to every other worker.
         self.pending_thoughts: deque[ThoughtEvent] = deque()
+        self.thought_log: deque[ThoughtEvent] = deque(maxlen=backlog)
         self.next_thought_seq = 0
+        self.pending_presence: dict[str, PresenceEvent] = {}
         self.outbox_ready = asyncio.Event()
 
     @property
@@ -452,6 +508,7 @@ class SwarmSessionHub:
             lease_ms=self._settings.lock_lease_ms,
             clock=self._clock,
             capacity=self._listener_capacity,
+            backlog=self._settings.thought_backlog_size,
             now_ms=now_ms,
         )
         handler = partial(self._on_bus_event, session)
@@ -510,6 +567,7 @@ class SwarmSessionHub:
             thought=thought,
         )
         session.next_thought_seq += 1
+        session.thought_log.append(event)
         session.fan_out(event)
         session.pending_thoughts.append(event)
         session.outbox_ready.set()
@@ -564,9 +622,56 @@ class SwarmSessionHub:
             await self._bus.publish(session_channel(session_id), event)
             return snapshot
 
-    def subscribe(self, session_id: str) -> SessionListener:
+    def touch(self, session_id: str) -> None:
+        """Count something a person did as activity, such as a heartbeat on an open connection."""
+        self._require(session_id).last_activity_ms = self._clock()
+
+    async def broadcast_presence(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        x: int = 0,
+        y: int = 0,
+        selected_id: str | None = None,
+        active: bool = True,
+    ) -> None:
+        """Queue a person's position or selection. Like a cursor, only the latest one matters."""
         session = self._require(session_id)
-        listener = SessionListener(self._listener_capacity, session.listeners.discard)
+        session.last_activity_ms = self._clock()
+        session.pending_presence[user_id] = PresenceEvent(
+            origin=self._origin,
+            session_id=session_id,
+            user_id=user_id,
+            x=x,
+            y=y,
+            selected_id=selected_id,
+            active=active,
+        )
+        session.outbox_ready.set()
+
+    def thought_backlog(self, session_id: str, after_seq: int | None = None) -> ThoughtBacklog:
+        """Return retained thoughts, all of them or only those after what a reader has seen.
+
+        A reader claiming to be ahead of the log cannot be trusted, so it gets everything retained
+        and is told about the gap. ``gap`` also reports what the ring evicted, and what another
+        worker's Pub/Sub never delivered here. It is never hidden behind an apparently whole list.
+        """
+        session = self._require(session_id)
+        retained = tuple(session.thought_log)
+        latest = session.next_thought_seq - 1
+        reported = None if latest < 0 else latest
+        if after_seq is None or after_seq > latest:
+            whole = len(retained) == latest + 1
+            return ThoughtBacklog(retained, after_seq is not None or not whole, reported)
+        missed = tuple(event for event in retained if event.seq > after_seq)
+        return ThoughtBacklog(missed, len(missed) != latest - after_seq, reported)
+
+    def subscribe(self, session_id: str, *, lossless: bool = False) -> SessionListener:
+        """Add a listener. A lossless one drops no state, so its consumer must police its pace."""
+        session = self._require(session_id)
+        capacity = None if lossless else self._listener_capacity
+        listener = SessionListener(capacity, session.listeners.discard)
         session.listeners.add(listener)
         return listener
 
@@ -651,10 +756,12 @@ class SwarmSessionHub:
             session.outbox_ready.clear()
             await self._flush_thoughts(session)
             frames, session.pending_frames = session.pending_frames, {}
-            cursors = [
+            presence, session.pending_presence = session.pending_presence, {}
+            cursors: list[CursorEvent | PresenceEvent] = [
                 CursorEvent(origin=self._origin, session_id=session.session_id, frame=frame)
                 for frame in frames.values()
             ]
+            cursors.extend(presence.values())
             for cursor in cursors:
                 session.fan_out(cursor)
             notices = tuple(session.pending_notices)
@@ -688,6 +795,7 @@ class SwarmSessionHub:
             if event.seq < session.next_thought_seq:
                 return
             session.next_thought_seq = event.seq + 1
+            session.thought_log.append(event)
         elif isinstance(event, StateEvent) and not self._adopt(session, event):
             return
         session.fan_out(event)
