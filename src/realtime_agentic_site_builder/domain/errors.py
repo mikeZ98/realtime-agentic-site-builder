@@ -183,6 +183,49 @@ class LockAcquisitionTimeoutError(SiteBuilderError):
         )
 
 
+class SessionNotFoundError(SiteBuilderError):
+    status: ClassVar[int] = 404
+    title: ClassVar[str] = "Session not found"
+    slug: ClassVar[str] = "session-not-found"
+
+    def __init__(self, *, session_id: str, instance: str | None = None) -> None:
+        super().__init__(
+            f"Session {session_id} does not exist or has been closed.",
+            instance=instance,
+            extensions={"session_id": session_id},
+        )
+
+
+class SessionAlreadyExistsError(SiteBuilderError):
+    status: ClassVar[int] = 409
+    title: ClassVar[str] = "Session already exists"
+    slug: ClassVar[str] = "session-already-exists"
+
+    def __init__(self, *, session_id: str, instance: str | None = None) -> None:
+        super().__init__(
+            f"Session {session_id} already exists.",
+            instance=instance,
+            extensions={"session_id": session_id},
+        )
+
+
+class DeltaRejectedError(SiteBuilderError):
+    """A delta that cannot join the session's log, as opposed to one whose patch fails to apply."""
+
+    status: ClassVar[int] = 409
+    title: ClassVar[str] = "Delta rejected"
+    slug: ClassVar[str] = "delta-rejected"
+
+    def __init__(
+        self, reason: str, *, session_id: str, delta_seq: int, instance: str | None = None
+    ) -> None:
+        super().__init__(
+            f"Delta {delta_seq} was rejected by session {session_id}: {reason}.",
+            instance=instance,
+            extensions={"session_id": session_id, "delta_seq": delta_seq},
+        )
+
+
 def element_resource_uri(target_id: str) -> str:
     """Return the URI identifying a lockable element in conflict diagnostics."""
     return f"urn:site-builder:element:{quote(target_id, safe='')}"

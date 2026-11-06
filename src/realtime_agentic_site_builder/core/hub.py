@@ -1,0 +1,595 @@
+"""Session orchestration, listener fan-out and the event bus that links workers together.
+
+Each worker owns its sessions in memory. Local listeners are served directly, so they keep working
+through a bus outage. The bus only carries events to other workers, which adopt them as replicas.
+Pub/Sub delivery is at-most-once and does not arbitrate writers, so a session needs a single
+writing worker at a time.
+"""
+
+import asyncio
+import contextlib
+import logging
+import uuid
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
+from functools import partial
+from typing import Annotated, Any, Final, Literal, Protocol, Self, cast
+
+from pydantic import Field, TypeAdapter, ValidationError, model_validator
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+from realtime_agentic_site_builder.config import Settings, get_settings
+from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
+from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager, LockEvent
+from realtime_agentic_site_builder.core.patch_engine import PatchEngine
+from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
+from realtime_agentic_site_builder.domain.base import DomainModel, Identifier
+from realtime_agentic_site_builder.domain.errors import (
+    DeltaRejectedError,
+    SessionAlreadyExistsError,
+    SessionNotFoundError,
+    SiteBuilderError,
+)
+from realtime_agentic_site_builder.domain.swarm import (
+    AgentCursorFrame,
+    ReplayTimeline,
+    StreamDelta,
+    SwarmSnapshot,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LISTENER_CAPACITY: Final = 256
+REDIS_TIMEOUT_S: Final = 2.0
+REDIS_READ_POLL_S: Final = 1.0
+REDIS_RETRY_DELAY_S: Final = 1.0
+REDIS_HEALTH_CHECK_INTERVAL_S: Final = 30
+
+_SESSION_CREATED_STEP: Final = "SESSION_CREATED"
+_DELTA_APPLIED_STEP: Final = "DELTA_APPLIED"
+
+
+class CursorEvent(DomainModel):
+    kind: Literal["cursor"] = "cursor"
+    origin: Identifier
+    session_id: Identifier
+    frame: AgentCursorFrame
+
+
+class StateEvent(DomainModel):
+    """A committed delta and the frame it produced, which carries the full resulting state."""
+
+    kind: Literal["state"] = "state"
+    origin: Identifier
+    session_id: Identifier
+    delta: StreamDelta
+    snapshot: SwarmSnapshot
+
+    @model_validator(mode="after")
+    def _require_own_delta(self) -> Self:
+        if self.delta.session_id != self.session_id:
+            raise ValueError(f"delta {self.delta.delta_seq} belongs to another session")
+        return self
+
+
+class LockNotice(DomainModel):
+    kind: Literal["lock"] = "lock"
+    origin: Identifier
+    session_id: Identifier
+    event: LockEvent
+
+
+SwarmEvent = CursorEvent | StateEvent | LockNotice
+BusHandler = Callable[[SwarmEvent], None]
+
+_EVENT_ADAPTER: Final[TypeAdapter[SwarmEvent]] = TypeAdapter(
+    Annotated[SwarmEvent, Field(discriminator="kind")]
+)
+_SESSION_ID: Final = TypeAdapter(Identifier)
+
+
+def session_channel(session_id: str) -> str:
+    return f"rasb:session:{session_id}"
+
+
+class EventBus(Protocol):
+    """Worker-to-worker transport. Handlers must not block.
+
+    ``publish`` is best effort and does not raise on transport failure, because the state it
+    announces is already committed and a caller retrying would be rejected as a duplicate.
+    """
+
+    async def publish(self, channel: str, event: SwarmEvent) -> None: ...
+
+    async def subscribe(self, channel: str, handler: BusHandler) -> None: ...
+
+    async def unsubscribe(self, channel: str, handler: BusHandler) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class InMemoryEventBus:
+    """Delivers synchronously within the process, passing the immutable events by reference."""
+
+    def __init__(self) -> None:
+        self._handlers: dict[str, list[BusHandler]] = {}
+
+    async def publish(self, channel: str, event: SwarmEvent) -> None:
+        for handler in tuple(self._handlers.get(channel, ())):
+            handler(event)
+
+    async def subscribe(self, channel: str, handler: BusHandler) -> None:
+        self._handlers.setdefault(channel, []).append(handler)
+
+    async def unsubscribe(self, channel: str, handler: BusHandler) -> None:
+        handlers = self._handlers[channel]
+        handlers.remove(handler)
+        if not handlers:
+            del self._handlers[channel]
+
+    async def close(self) -> None:
+        self._handlers.clear()
+
+
+class RedisPubSubClient(Protocol):
+    """The part of ``redis.asyncio.client.PubSub`` this bus relies on."""
+
+    async def subscribe(self, *channels: str) -> None: ...
+
+    def unsubscribe(self, *channels: str) -> Awaitable[object]: ...
+
+    async def get_message(
+        self, ignore_subscribe_messages: bool = False, timeout: float | None = 0.0
+    ) -> Mapping[str, Any] | None: ...
+
+    async def aclose(self) -> None: ...
+
+
+class RedisClient(Protocol):
+    """The part of ``redis.asyncio.Redis`` this bus relies on."""
+
+    def publish(self, channel: str, message: str) -> Awaitable[int]: ...
+
+    def pubsub(self) -> RedisPubSubClient: ...
+
+    async def aclose(self) -> None: ...
+
+
+class RedisEventBus:
+    """Multiplexes all channels over one Pub/Sub connection, so sessions do not cost connections.
+
+    The client reads raw bytes rather than decoding responses, so that a foreign publisher's invalid
+    UTF-8 fails event validation instead of killing the reader task.
+    """
+
+    def __init__(self, client: RedisClient, *, retry_delay_s: float = REDIS_RETRY_DELAY_S) -> None:
+        self._client = client
+        self._pubsub = client.pubsub()
+        self._retry_delay_s = retry_delay_s
+        self._handlers: dict[str, list[BusHandler]] = {}
+        self._reader: asyncio.Task[None] | None = None
+
+    @classmethod
+    def from_url(cls, url: str) -> Self:
+        """Build a bus. The client connects lazily, on first use."""
+        client = Redis.from_url(
+            url,
+            socket_connect_timeout=REDIS_TIMEOUT_S,
+            socket_timeout=REDIS_TIMEOUT_S,
+            health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_S,
+        )
+        return cls(cast("RedisClient", client))
+
+    async def publish(self, channel: str, event: SwarmEvent) -> None:
+        try:
+            await self._client.publish(channel, event.model_dump_json())
+        except (RedisError, OSError) as error:
+            logger.warning("dropping %s event on %s: %r", event.kind, channel, error)
+
+    async def subscribe(self, channel: str, handler: BusHandler) -> None:
+        """Register a handler, raising if Redis cannot take the subscription right now."""
+        if channel not in self._handlers:
+            await self._pubsub.subscribe(channel)
+        self._handlers.setdefault(channel, []).append(handler)
+        if self._reader is None:
+            self._reader = asyncio.create_task(self._read_loop())
+
+    async def unsubscribe(self, channel: str, handler: BusHandler) -> None:
+        handlers = self._handlers[channel]
+        handlers.remove(handler)
+        if handlers:
+            return
+        del self._handlers[channel]
+        try:
+            await self._pubsub.unsubscribe(channel)
+        except (RedisError, OSError) as error:
+            logger.warning("could not unsubscribe from %s: %r", channel, error)
+
+    async def close(self) -> None:
+        if self._reader is not None:
+            self._reader.cancel()
+            await asyncio.gather(self._reader, return_exceptions=True)
+            self._reader = None
+        self._handlers.clear()
+        await self._pubsub.aclose()
+        await self._client.aclose()
+
+    async def _read_loop(self) -> None:
+        while True:
+            try:
+                message = await self._pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=REDIS_READ_POLL_S
+                )
+            except (RedisError, OSError) as error:
+                # The client restores its subscriptions when the next read reconnects.
+                logger.warning("event bus read failed: %r", error)
+                await asyncio.sleep(self._retry_delay_s)
+                continue
+            if message is not None:
+                self._deliver(message)
+
+    def _deliver(self, message: Mapping[str, Any]) -> None:
+        channel = message["channel"].decode(errors="replace")
+        try:
+            event = _EVENT_ADAPTER.validate_json(message["data"])
+        except (ValidationError, SiteBuilderError) as error:
+            logger.warning("discarding invalid event on %s: %s", channel, type(error).__name__)
+            return
+        for handler in tuple(self._handlers.get(channel, ())):
+            handler(event)
+
+
+def create_event_bus(settings: Settings) -> EventBus:
+    if settings.redis_url is None:
+        return InMemoryEventBus()
+    return RedisEventBus.from_url(str(settings.redis_url))
+
+
+class SessionListener:
+    """One consumer's buffer. Offering never blocks, so a slow consumer only hurts itself.
+
+    Cursor frames are ephemeral, so only the latest per agent is kept. State and lock events wait in
+    a bounded queue that drops the oldest on overflow. That is safe for state, because every state
+    event carries the full bundle. They are delivered ahead of cursors, and ``dropped`` counts what
+    this listener missed.
+    """
+
+    def __init__(self, capacity: int, on_close: Callable[["SessionListener"], None]) -> None:
+        self._events: deque[StateEvent | LockNotice] = deque(maxlen=capacity)
+        self._cursors: dict[str, CursorEvent] = {}
+        self._wakeup = asyncio.Event()
+        self._on_close = on_close
+        self._closed = False
+        self.dropped = 0
+
+    def offer(self, event: SwarmEvent) -> None:
+        if isinstance(event, CursorEvent):
+            self.dropped += event.frame.agent_id in self._cursors
+            self._cursors[event.frame.agent_id] = event
+        else:
+            self.dropped += len(self._events) == self._events.maxlen
+            self._events.append(event)
+        self._wakeup.set()
+
+    def close(self) -> None:
+        """Stop receiving. Buffered events can still be read before iteration ends."""
+        self._closed = True
+        self._on_close(self)
+        self._wakeup.set()
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> SwarmEvent:
+        while not self._events and not self._cursors:
+            if self._closed:
+                raise StopAsyncIteration
+            self._wakeup.clear()
+            await self._wakeup.wait()
+        if self._events:
+            return self._events.popleft()
+        return self._cursors.pop(next(iter(self._cursors)))
+
+
+class _Session:
+    """A session's mutable state. Only the hub touches it, on the event loop."""
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        origin: str,
+        first_frame: SwarmSnapshot,
+        lease_ms: int,
+        clock: Clock,
+        capacity: int,
+        now_ms: int,
+    ) -> None:
+        self.session_id = session_id
+        self.origin = origin
+        self.locks = AsyncLockManager(lease_ms=lease_ms, clock=clock, on_event=self._relay_lock)
+        # Serializes writers across the await on the bus, so workers see commits in order.
+        self.mutex = asyncio.Lock()
+        self.closed = False
+        self.last_activity_ms = now_ms
+        self.listeners: set[SessionListener] = set()
+        self.agents: dict[str, AgentCursorFrame] = {}
+        self.deltas: list[StreamDelta] = []
+        self.snapshots = [first_frame]
+        self.pending_frames: dict[str, AgentCursorFrame] = {}
+        self.pending_notices: deque[LockNotice] = deque(maxlen=capacity)
+        self.outbox_ready = asyncio.Event()
+
+    @property
+    def latest(self) -> SwarmSnapshot:
+        return self.snapshots[-1]
+
+    @property
+    def last_delta_seq(self) -> int:
+        return self.deltas[-1].delta_seq if self.deltas else -1
+
+    def fan_out(self, event: SwarmEvent) -> None:
+        for listener in self.listeners:
+            listener.offer(event)
+
+    def record(self, delta: StreamDelta, snapshot: SwarmSnapshot) -> None:
+        self.deltas.append(delta)
+        self.snapshots.append(snapshot)
+
+    def timeline(self) -> ReplayTimeline:
+        # Built on demand: revalidating an ever-growing model per delta would cost quadratic time.
+        return ReplayTimeline(
+            session_id=self.session_id, deltas=tuple(self.deltas), snapshots=tuple(self.snapshots)
+        )
+
+    def frames_for_snapshot(self) -> tuple[AgentCursorFrame, ...]:
+        """Return the latest frames, clearing locks that were released since each was sent.
+
+        A frame is the agent's own claim and goes stale when a lock moves on. Left in place, a stale
+        claim would fail the snapshot's validation and block an otherwise valid delta.
+        """
+        active = self.locks.active_locks()
+        return tuple(
+            frame
+            if frame.active_lock is None or frame.active_lock in active
+            else frame.model_copy(update={"active_lock": None})
+            for _, frame in sorted(self.agents.items())
+        )
+
+    def _relay_lock(self, event: LockEvent) -> None:
+        notice = LockNotice(origin=self.origin, session_id=self.session_id, event=event)
+        self.fan_out(notice)
+        self.pending_notices.append(notice)
+        self.outbox_ready.set()
+
+
+class SwarmSessionHub:
+    """Owns the sessions of one worker: their state, locks, replay logs and listeners.
+
+    ``sweep`` must be called periodically by whatever hosts the hub. Without it, lapsed leases are
+    only reclaimed when another agent contends for them, and idle sessions stay open.
+    """
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        bus: EventBus | None = None,
+        clock: Clock = system_now_ms,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        listener_capacity: int = DEFAULT_LISTENER_CAPACITY,
+    ) -> None:
+        self._settings = settings or get_settings()
+        self._owns_bus = bus is None
+        self._bus = create_event_bus(self._settings) if bus is None else bus
+        self._clock = clock
+        self._sleep = sleep
+        self._listener_capacity = listener_capacity
+        self._engine = PatchEngine(
+            max_patch_size_bytes=self._settings.max_patch_size_bytes, clock=clock
+        )
+        self._origin = uuid.uuid4().hex
+        self._sessions: dict[str, _Session] = {}
+        self._pumps: dict[str, asyncio.Task[None]] = {}
+        self._bus_handlers: dict[str, BusHandler] = {}
+
+    async def create_session(
+        self, session_id: str, initial_bundle: FullstackProjectBundle
+    ) -> SwarmSnapshot:
+        """Open a session and return its first frame, the base state its replay starts from."""
+        # Events embed the id, so a bad one would otherwise only surface inside the frame pump.
+        _SESSION_ID.validate_python(session_id)
+        if session_id in self._sessions:
+            raise SessionAlreadyExistsError(session_id=session_id)
+        now_ms = self._clock()
+        session = _Session(
+            session_id,
+            origin=self._origin,
+            first_frame=self._engine.generate_snapshot(
+                initial_bundle, 0, _SESSION_CREATED_STEP, (), (), timestamp_ms=now_ms
+            ),
+            lease_ms=self._settings.lock_lease_ms,
+            clock=self._clock,
+            capacity=self._listener_capacity,
+            now_ms=now_ms,
+        )
+        handler = partial(self._on_bus_event, session)
+        self._sessions[session_id] = session
+        self._pumps[session_id] = asyncio.create_task(self._pump(session))
+        self._bus_handlers[session_id] = handler
+        try:
+            await self._bus.subscribe(session_channel(session_id), handler)
+        except BaseException:
+            await self._discard(session)
+            raise
+        return session.latest
+
+    async def close_session(self, session_id: str) -> ReplayTimeline:
+        """End a session once in-flight deltas finish, and return its complete replay log."""
+        async with self._exclusive(session_id) as session:
+            handler = await self._discard(session)
+            await self._bus.unsubscribe(session_channel(session_id), handler)
+            return session.timeline()
+
+    async def shutdown(self) -> None:
+        """Close every session, and the bus if this hub created it."""
+        for session_id in tuple(self._sessions):
+            with contextlib.suppress(SessionNotFoundError):
+                await self.close_session(session_id)
+        if self._owns_bus:
+            await self._bus.close()
+
+    async def broadcast_frame(self, session_id: str, frame: AgentCursorFrame) -> None:
+        """Queue a cursor update for the session's frame pump, without waiting for any consumer."""
+        session = self._require(session_id)
+        session.last_activity_ms = self._clock()
+        session.agents[frame.agent_id] = frame
+        session.pending_frames[frame.agent_id] = frame
+        session.outbox_ready.set()
+
+    async def apply_delta(self, session_id: str, delta: StreamDelta) -> SwarmSnapshot:
+        """Commit a delta, record it for replay and announce the new state.
+
+        Nothing about the session changes unless the delta is fully accepted.
+        """
+        if delta.session_id != session_id:
+            raise DeltaRejectedError(
+                f"it is addressed to session {delta.session_id}",
+                session_id=session_id,
+                delta_seq=delta.delta_seq,
+            )
+        async with self._exclusive(session_id) as session:
+            if delta.delta_seq <= session.last_delta_seq:
+                raise DeltaRejectedError(
+                    f"its sequence number does not follow {session.last_delta_seq}",
+                    session_id=session_id,
+                    delta_seq=delta.delta_seq,
+                )
+            bundle, _ = self._engine.apply_patch(session.latest.bundle_state, delta)
+            now_ms = self._clock()
+            snapshot = self._engine.generate_snapshot(
+                bundle,
+                session.latest.frame_seq + 1,
+                _DELTA_APPLIED_STEP,
+                session.frames_for_snapshot(),
+                session.locks.active_locks(),
+                # A wall clock can step backwards, but a replay's frames must not.
+                timestamp_ms=max(now_ms, session.latest.timestamp_ms),
+            )
+            session.record(delta, snapshot)
+            session.last_activity_ms = now_ms
+            event = StateEvent(
+                origin=self._origin, session_id=session_id, delta=delta, snapshot=snapshot
+            )
+            session.fan_out(event)
+            await self._bus.publish(session_channel(session_id), event)
+            return snapshot
+
+    def subscribe(self, session_id: str) -> SessionListener:
+        session = self._require(session_id)
+        listener = SessionListener(self._listener_capacity, session.listeners.discard)
+        session.listeners.add(listener)
+        return listener
+
+    def lock_manager(self, session_id: str) -> AsyncLockManager:
+        return self._require(session_id).locks
+
+    def timeline(self, session_id: str) -> ReplayTimeline:
+        return self._require(session_id).timeline()
+
+    async def sweep(self, now_ms: int | None = None) -> tuple[str, ...]:
+        """Reclaim lapsed locks in every session, close idle ones and return the closed ids."""
+        now = self._clock() if now_ms is None else now_ms
+        ttl_ms = self._settings.session_ttl_seconds * 1000
+        idle: list[str] = []
+        for session_id, session in tuple(self._sessions.items()):
+            await session.locks.sweep_expired(now)
+            if now - session.last_activity_ms >= ttl_ms:
+                idle.append(session_id)
+        for session_id in idle:
+            with contextlib.suppress(SessionNotFoundError):
+                await self.close_session(session_id)
+        return tuple(idle)
+
+    def _require(self, session_id: str) -> _Session:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id=session_id)
+        return session
+
+    @asynccontextmanager
+    async def _exclusive(self, session_id: str) -> AsyncIterator[_Session]:
+        session = self._require(session_id)
+        async with session.mutex:
+            # The session may have closed while this caller queued for the mutex.
+            if session.closed:
+                raise SessionNotFoundError(session_id=session_id)
+            yield session
+
+    async def _discard(self, session: _Session) -> BusHandler:
+        """Take a session out of service and return the handler still to unsubscribe."""
+        session.closed = True
+        del self._sessions[session.session_id]
+        pump = self._pumps.pop(session.session_id)
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+        for listener in tuple(session.listeners):
+            listener.close()
+        return self._bus_handlers.pop(session.session_id)
+
+    async def _pump(self, session: _Session) -> None:
+        """Flush at most ``broadcast_fps`` times a second, on the leading and the trailing edge.
+
+        The first update after a quiet spell goes out at once. Updates during the pause conflate
+        into one flush after it, so an agent's final position is never lost, and a slow bus delays
+        this task alone, never the callers of ``broadcast_frame``.
+        """
+        channel = session_channel(session.session_id)
+        interval_s = 1 / self._settings.broadcast_fps
+        while True:
+            await session.outbox_ready.wait()
+            session.outbox_ready.clear()
+            frames, session.pending_frames = session.pending_frames, {}
+            cursors = [
+                CursorEvent(origin=self._origin, session_id=session.session_id, frame=frame)
+                for frame in frames.values()
+            ]
+            for cursor in cursors:
+                session.fan_out(cursor)
+            notices = tuple(session.pending_notices)
+            session.pending_notices.clear()
+            outgoing: tuple[SwarmEvent, ...] = (*cursors, *notices)
+            for event in outgoing:
+                await self._bus.publish(channel, event)
+            await self._sleep(interval_s)
+
+    def _on_bus_event(self, session: _Session, event: SwarmEvent) -> None:
+        if event.origin == self._origin or event.session_id != session.session_id:
+            return
+        session.last_activity_ms = self._clock()
+        if isinstance(event, CursorEvent):
+            session.agents[event.frame.agent_id] = event.frame
+        elif isinstance(event, StateEvent) and not self._adopt(session, event):
+            return
+        session.fan_out(event)
+
+    @staticmethod
+    def _adopt(session: _Session, event: StateEvent) -> bool:
+        """Take another worker's commit into this replica, unless it would rewrite history."""
+        snapshot = event.snapshot
+        if (
+            event.delta.delta_seq <= session.last_delta_seq
+            or snapshot.frame_seq <= session.latest.frame_seq
+        ):
+            logger.warning(
+                "ignoring out-of-order delta %d for session %s",
+                event.delta.delta_seq,
+                session.session_id,
+            )
+            return False
+        # Workers' clocks skew, but this replica's own timeline has to stay ordered.
+        timestamp_ms = max(snapshot.timestamp_ms, session.latest.timestamp_ms)
+        session.record(event.delta, snapshot.model_copy(update={"timestamp_ms": timestamp_ms}))
+        return True
