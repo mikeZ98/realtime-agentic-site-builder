@@ -13,6 +13,8 @@ dependencies = [
     "langgraph>=0.0.60",
     "langchain-core>=0.2.0",
     "redis[hiredis]>=5.0.0",
+    "anthropic>=2.6.0",
+    "httpx>=0.28.0",
 ]
 
 [dependency-groups]

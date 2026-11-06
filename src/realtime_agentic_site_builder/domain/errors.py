@@ -226,6 +226,25 @@ class DeltaRejectedError(SiteBuilderError):
         )
 
 
+class LLMProviderError(SiteBuilderError):
+    """A model call failed, refused, or kept returning output that fails validation."""
+
+    status: ClassVar[int] = 502
+    title: ClassVar[str] = "LLM provider failure"
+    slug: ClassVar[str] = "llm-provider-failure"
+
+    def __init__(self, reason: str, *, model: str, instance: str | None = None) -> None:
+        super().__init__(
+            f"Model {model} failed: {reason}.", instance=instance, extensions={"model": model}
+        )
+
+
+class LLMConfigurationError(SiteBuilderError):
+    status: ClassVar[int] = 500
+    title: ClassVar[str] = "LLM configuration failure"
+    slug: ClassVar[str] = "llm-configuration-failure"
+
+
 def element_resource_uri(target_id: str) -> str:
     """Return the URI identifying a lockable element in conflict diagnostics."""
     return f"urn:site-builder:element:{quote(target_id, safe='')}"

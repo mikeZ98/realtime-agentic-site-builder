@@ -320,6 +320,7 @@ class _Session:
         self.agents: dict[str, AgentCursorFrame] = {}
         self.deltas: list[StreamDelta] = []
         self.snapshots = [first_frame]
+        self.reserved_delta_seq = -1
         self.pending_frames: dict[str, AgentCursorFrame] = {}
         self.pending_notices: deque[LockNotice] = deque(maxlen=capacity)
         self.outbox_ready = asyncio.Event()
@@ -518,6 +519,27 @@ class SwarmSessionHub:
 
     def lock_manager(self, session_id: str) -> AsyncLockManager:
         return self._require(session_id).locks
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    def now_ms(self) -> int:
+        return self._clock()
+
+    def latest_snapshot(self, session_id: str) -> SwarmSnapshot:
+        return self._require(session_id).latest
+
+    def reserve_delta_seq(self, session_id: str) -> int:
+        """Return the next sequence number for concurrent writers to one session.
+
+        Writers queue on the session mutex in arrival order, so numbers stay in commit order as long
+        as the caller passes this to ``apply_delta`` without suspending in between. A rejected delta
+        leaves a gap, which the log allows.
+        """
+        session = self._require(session_id)
+        session.reserved_delta_seq = max(session.reserved_delta_seq, session.last_delta_seq) + 1
+        return session.reserved_delta_seq
 
     def timeline(self, session_id: str) -> ReplayTimeline:
         return self._require(session_id).timeline()
