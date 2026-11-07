@@ -873,7 +873,8 @@ _SCRIPT: Final = r"""
       rctx.strokeStyle = pulse.ok ? "#10b981" : "#f87171";
       rctx.lineWidth = pulse.ok ? 2 : 2 + 3 * (1 - age);
       rctx.beginPath();
-      rctx.arc(cx, cy, r * (0.15 + age), 0, Math.PI * 2);
+      // With reduced motion the ring fades where it is instead of travelling outward.
+      rctx.arc(cx, cy, r * (calm.matches ? 1 : 0.15 + age), 0, Math.PI * 2);
       rctx.stroke();
     }
     rctx.globalAlpha = 1;
