@@ -39,6 +39,8 @@ packages = ["src/realtime_agentic_site_builder"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+# The end-to-end suites share one harness module, which this puts on the import path.
+pythonpath = ["tests/integration"]
 cache_dir = "./.cache/pytest/"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
@@ -85,7 +87,7 @@ cache_dir = "./.cache/mypy/"
 disallow_untyped_defs = true
 warn_return_any = true
 strict_equality = true
-mypy_path = "src"
+mypy_path = "src:tests/integration"
 explicit_package_bases = true
 files = ["src", "tests"]
 
