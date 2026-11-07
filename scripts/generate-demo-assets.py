@@ -13,6 +13,7 @@ import hashlib
 import io
 import itertools
 import math
+import random
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -28,10 +29,12 @@ from realtime_agentic_site_builder.canvas.compositor import (
     LockOverlay,
     ThoughtBadge,
     VisualFrame,
+    human_color,
 )
-from realtime_agentic_site_builder.canvas.projection import hermite_controls
+from realtime_agentic_site_builder.canvas.projection import DeadReckoner, hermite_controls
+from realtime_agentic_site_builder.canvas.viewer import CLIENT_BUFFER_MS
 from realtime_agentic_site_builder.core.hub import ThoughtEvent
-from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager
+from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager, LockEvent
 from realtime_agentic_site_builder.domain.backend import (
     BackendBlueprint,
     DatabaseDialect,
@@ -51,6 +54,8 @@ ROOT: Final = Path(__file__).resolve().parent.parent
 ASSETS: Final = ROOT / "docs" / "assets"
 GIF_PATH: Final = ASSETS / "swarm-live-demo.gif"
 SVG_PATH: Final = ASSETS / "architecture-topology.svg"
+CONVERGENCE_PATH: Final = ASSETS / "dead-reckoning-convergence.svg"
+LOCKS_PATH: Final = ASSETS / "lock-contention-matrix.svg"
 
 WORLD: Final = Viewport(1920, 1080)
 OUT_W, OUT_H = 800, 450
@@ -729,6 +734,401 @@ SVG_DESCRIPTION: Final = (
 )
 
 
+# --- shared chart styling -------------------------------------------------------------------
+
+INK: Final = "#E5E7EB"
+INK_MUTED: Final = "#94A3B8"
+INK_FAINT: Final = "#64748B"
+GRID: Final = "#1F2937"
+SURFACE: Final = "#0B0F19"
+# Validated for the dark surface with the dataviz palette checker: lightness band, chroma,
+# colour-vision separation (worst delta E 32) and contrast all pass.
+WITHOUT_CONVERGENCE: Final = "#EA580C"
+WITH_CONVERGENCE: Final = "#8B5CF6"
+CRITICAL: Final = "#EF4444"
+
+
+def _svg_open(width: int, height: int, title: str, description: str) -> list[str]:
+    return [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}"'
+        f' width="{width}" height="{height}" role="img" aria-labelledby="t d">',
+        f'<title id="t">{title}</title>',
+        f'<desc id="d">{description}</desc>',
+        f"<style>text {{ font-family: {SVG_FONT}; }}"
+        " .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }</style>",
+        f'<rect width="{width}" height="{height}" rx="14" fill="{SURFACE}"/>',
+    ]
+
+
+def _text(
+    x: float,
+    y: float,
+    text: str,
+    *,
+    size: int = 12,
+    fill: str = INK_MUTED,
+    weight: int = 400,
+    anchor: str = "start",
+    mono: bool = False,
+) -> str:
+    klass = ' class="mono"' if mono else ""
+    return (
+        f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" font-weight="{weight}"'
+        f' fill="{fill}" text-anchor="{anchor}"{klass}>{text}</text>'
+    )
+
+
+# --- dead reckoning convergence ---------------------------------------------------------------
+
+CONVERGENCE_SECONDS: Final = 3.0
+TICK_MS: Final = 1000 / 30
+
+
+def _truth(t_ms: float) -> Point:
+    return Point(960 + 620 * math.sin(t_ms / 380), 540 + 260 * math.sin(t_ms / 300 + 1))
+
+
+@dataclass(frozen=True, slots=True)
+class ConvergenceSeries:
+    times_s: list[float]
+    truth: list[float]
+    without: list[float]
+    with_convergence: list[float]
+    losses: list[tuple[float, float]]
+
+
+def convergence_series() -> ConvergenceSeries:
+    """Render one lossy 30 Hz stream at 120 Hz twice: the bare spline, and with convergence."""
+    rng = random.Random(4)
+    bursts = set(range(20, 29)) | set(range(55, 69))  # About 300 ms and 470 ms of total loss.
+    ticks = round(CONVERGENCE_SECONDS * 1000 / TICK_MS) + 4
+    kept = [tick == 0 or (tick not in bursts and rng.random() >= 0.25) for tick in range(ticks)]
+    bare, converging = DeadReckoner(0.0, _truth(0.0)), DeadReckoner(0.0, _truth(0.0))
+    series = ConvergenceSeries([], [], [], [], [])
+    next_tick, last_arrival = 1, 0.0
+    for step in range(round((CONVERGENCE_SECONDS * 1000 + CLIENT_BUFFER_MS) / (1000 / 120))):
+        now = step * 1000 / 120
+        while next_tick * TICK_MS <= now:
+            arrival = next_tick * TICK_MS
+            if kept[next_tick]:
+                if arrival - last_arrival > 4 * TICK_MS:
+                    series.losses.append((last_arrival / 1000, arrival / 1000))
+                last_arrival = arrival
+                for tracker in (bare, converging):
+                    tracker.observe(arrival, _truth(arrival))
+            next_tick += 1
+        at = now - CLIENT_BUFFER_MS
+        if at < 0:
+            continue
+        series.times_s.append(at / 1000)
+        series.truth.append(_truth(at).x)
+        # The bare spline: the same samples and coasting, but nothing easing out a correction.
+        series.without.append(bare._spline(at, WORLD).position.x)
+        series.with_convergence.append(converging.sample(at, WORLD).position.x)
+    return series
+
+
+def _worst_jump(times: Sequence[float], values: Sequence[float], truth: Sequence[float]) -> float:
+    return max(
+        abs(values[i] - values[i - 1]) - abs(truth[i] - truth[i - 1]) for i in range(1, len(times))
+    )
+
+
+def convergence_svg() -> str:
+    data = convergence_series()
+    width, height = 1000, 580
+    left, right = 70, 970
+    panels = ((122, 350), (410, 530))  # Position, then error, sharing one time axis.
+
+    def sx(t_s: float) -> float:
+        return left + (right - left) * t_s / CONVERGENCE_SECONDS
+
+    def path(values: Sequence[float], top: int, bottom: int, low: float, high: float) -> str:
+        def sy(value: float) -> float:
+            return bottom - (bottom - top) * (value - low) / (high - low)
+
+        return " ".join(
+            f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy(v):.1f}"
+            for i, (t, v) in enumerate(zip(data.times_s, values, strict=True))
+        )
+
+    def line(x1: float, y1: float, x2: float, y2: float, color: str, extra: str = "") -> str:
+        return (
+            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"'
+            f' stroke="{color}" stroke-width="{2 if extra else 1}"{extra}/>'
+        )
+
+    errors_without = [abs(a - b) for a, b in zip(data.without, data.truth, strict=True)]
+    errors_with = [abs(a - b) for a, b in zip(data.with_convergence, data.truth, strict=True)]
+    jump_without = _worst_jump(data.times_s, data.without, data.truth)
+    jump_with = _worst_jump(data.times_s, data.with_convergence, data.truth)
+    parts = _svg_open(
+        width,
+        height,
+        "Dead reckoning with and without convergence",
+        "A cursor's x position over three seconds of a 30 Hz stream with two long bursts of "
+        f"packet loss. Without convergence the track snaps by up to {jump_without:.0f} px in one "
+        f"rendered frame when a burst ends. With 120 ms convergence the worst frame-to-frame jump "
+        f"is {jump_with:.0f} px, at the cost of staying off the real position slightly longer.",
+    )
+    parts.append(_text(30, 40, "Dead reckoning through packet loss", size=18, weight=700, fill=INK))
+    parts.append(
+        _text(
+            30,
+            62,
+            f"Worst jump in one 120 Hz frame: {jump_without:.0f} px without convergence,"
+            f" {jump_with:.0f} px with it. The price is staying off the real position for about"
+            " 120 ms longer after a burst.",
+            size=12,
+            fill=INK_FAINT,
+        )
+    )
+    legend_x = 30.0
+    for label, color, dashed in (
+        ("Real position", INK_FAINT, True),
+        ("Without convergence", WITHOUT_CONVERGENCE, False),
+        ("With 120 ms convergence", WITH_CONVERGENCE, False),
+    ):
+        dash = ' stroke-dasharray="5 4"' if dashed else ' stroke-dasharray="none"'
+        parts.append(line(legend_x, 88, legend_x + 18, 88, color, dash))
+        parts.append(_text(legend_x + 24, 92, label, size=11))
+        legend_x += 24 + len(label) * 6.4 + 22
+    for start, end in data.losses:
+        x0, x1 = sx(max(start, 0)), sx(min(end, CONVERGENCE_SECONDS))
+        span = panels[1][1] - panels[0][0]
+        parts.append(
+            f'<rect x="{x0:.1f}" y="{panels[0][0]}" width="{x1 - x0:.1f}" height="{span}"'
+            ' fill="#F8FAFC" fill-opacity="0.05"/>'
+        )
+        if x1 - x0 >= 80:
+            label_x = (x0 + x1) / 2
+            parts.append(
+                _text(label_x, panels[0][0] + 14, "packets lost", size=10, anchor="middle")
+            )
+
+    def axes(top: int, bottom: int, low: float, high: float, step: float) -> None:
+        value = low
+        while value <= high + 1e-9:
+            y = bottom - (bottom - top) * (value - low) / (high - low)
+            parts.append(line(left, y, right, y, GRID))
+            parts.append(_text(left - 8, y + 4, f"{value:.0f}", size=10, anchor="end"))
+            value += step
+
+    positions = data.truth + data.without + data.with_convergence
+    low, high = math.floor(min(positions) / 200) * 200, math.ceil(max(positions) / 200) * 200
+    axes(*panels[0], low, high, 200)
+    parts.append(_text(left, panels[0][0] - 8, "Cursor x (px)", size=11))
+    error_high = math.ceil(max(errors_without) / 100) * 100
+    axes(*panels[1], 0, error_high, error_high / 2)
+    parts.append(_text(left, panels[1][0] - 8, "Distance from the real position (px)", size=11))
+    for second in range(int(CONVERGENCE_SECONDS) + 1):
+        parts.append(_text(sx(second), panels[1][1] + 18, f"{second} s", size=10, anchor="middle"))
+    for values, color, dashed in (
+        (data.truth, INK_FAINT, True),
+        (data.without, WITHOUT_CONVERGENCE, False),
+        (data.with_convergence, WITH_CONVERGENCE, False),
+    ):
+        dash = ' stroke-dasharray="5 4"' if dashed else ""
+        parts.append(
+            f'<path d="{path(values, *panels[0], low, high)}" fill="none" stroke="{color}"'
+            f' stroke-width="2" stroke-linejoin="round"{dash}/>'
+        )
+    for values, color in ((errors_without, WITHOUT_CONVERGENCE), (errors_with, WITH_CONVERGENCE)):
+        parts.append(
+            f'<path d="{path(values, *panels[1], 0, error_high)}" fill="none" stroke="{color}"'
+            ' stroke-width="2" stroke-linejoin="round"/>'
+        )
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
+# --- lock contention matrix -------------------------------------------------------------------
+
+LOCK_PARTICIPANTS: Final = (
+    ("agent-architect", "Architect", 90),
+    ("user:alice", "Owner (person)", 80),
+    ("agent-coder", "Frontend Coder", 60),
+    ("agent-styler", "Styler", 40),
+)
+_LOCK_COLORS: Final = {
+    "agent-architect": IDENTITIES[ARCHITECT].color,
+    "user:alice": human_color("alice"),
+    "agent-coder": IDENTITIES[CODER].color,
+    "agent-styler": IDENTITIES[STYLER].color,
+}
+
+
+_SHORT: Final = {
+    "agent-architect": "Architect",
+    "user:alice": "Owner",
+    "agent-coder": "Coder",
+    "agent-styler": "Styler",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LockStep:
+    action: str
+    states: dict[str, list[tuple[str, str]]]  # participant -> [(target, state)]
+    events: list[str]
+    preempted: frozenset[str]
+
+
+async def lock_scenario() -> list[LockStep]:
+    """Drive the real lock manager through contention, a priority handoff and a deadlock."""
+    now = 1_000
+    events: list[LockEvent] = []
+    manager = AsyncLockManager(lease_ms=30_000, clock=lambda: now, on_event=events.append)
+    priority = {agent: rank for agent, _, rank in LOCK_PARTICIPANTS}
+    script: list[tuple[str, str, str, str]] = [
+        ("Owner takes hero", "acquire", "user:alice", "hero"),
+        ("Styler queues for hero", "acquire", "agent-styler", "hero"),
+        ("Coder queues for hero", "acquire", "agent-coder", "hero"),
+        ("Architect queues for hero", "acquire", "agent-architect", "hero"),
+        ("Owner releases hero", "release", "user:alice", "hero"),
+        ("Coder takes the title", "acquire", "agent-coder", "document"),
+        ("Architect wants the title", "acquire", "agent-architect", "document"),
+        ("Architect releases hero", "release", "agent-architect", "hero"),
+    ]
+    steps: list[LockStep] = []
+    for action, verb, agent, target in script:
+        events.clear()
+        if verb == "acquire":
+            await manager.acquire(target, agent, priority[agent], now)
+        else:
+            await manager.release(target, agent)
+        now += 100
+        states: dict[str, list[tuple[str, str]]] = {
+            agent_id: [] for agent_id, _, _ in LOCK_PARTICIPANTS
+        }
+        for lock in manager.active_locks():
+            states[lock.locked_by_agent_id].append((lock.target_id, lock.state.value))
+        notes = [
+            f"✕ {_SHORT[event.lock.locked_by_agent_id]} loses {event.lock.target_id}"
+            if event.kind.value == "PREEMPTED"
+            else f"→ {_SHORT[event.lock.locked_by_agent_id]} gets {event.lock.target_id}"
+            for event in events
+        ]
+        preempted = frozenset(
+            event.lock.locked_by_agent_id for event in events if event.kind.value == "PREEMPTED"
+        )
+        steps.append(LockStep(action, states, notes, preempted))
+    return steps
+
+
+def locks_svg() -> str:
+    steps = asyncio.run(lock_scenario())
+    width, label_w, cell_w, row_h = 1280, 170, 136, 64
+    top = 150
+    height = top + row_h * len(LOCK_PARTICIPANTS) + 150
+    parts = _svg_open(
+        width,
+        height,
+        "Lock contention matrix",
+        "Eight steps through the real lock manager. Three agents queue for a component an owner "
+        "holds. On release it passes to the highest priority waiter, the Architect. The Coder "
+        "then takes the title, the Architect asks for it, and the wait cycle is broken by "
+        "preempting the lower ranked Coder, which loses everything it held or waited for.",
+    )
+    parts.append(_text(30, 40, "Two-phase locking under contention", size=18, weight=700, fill=INK))
+    parts.append(
+        _text(
+            30,
+            62,
+            "Each cell is the real lock table after the step above it. Priority decides who is"
+            " promoted next and who gives way in a deadlock. It never takes a lock from a live"
+            " holder.",
+            size=12,
+            fill=INK_FAINT,
+        )
+    )
+    for column, step in enumerate(steps):
+        x = label_w + column * cell_w
+        parts.append(
+            _text(x + 8, top - 40, f"{column + 1}", size=11, weight=700, fill=INK, mono=True)
+        )
+        words, line = step.action.split(), ""
+        rows: list[str] = []
+        for word in words:
+            if len(line) + len(word) > 17:
+                rows.append(line)
+                line = word
+            else:
+                line = f"{line} {word}".strip()
+        rows.append(line)
+        for index, text in enumerate(rows):
+            parts.append(_text(x + 8, top - 24 + index * 14, text, size=11, fill=INK_MUTED))
+    for row, (agent_id, name, rank) in enumerate(LOCK_PARTICIPANTS):
+        y = top + row * row_h + 18
+        color = _LOCK_COLORS[agent_id]
+        parts.append(f'<circle cx="38" cy="{y + row_h / 2 - 4:.1f}" r="5" fill="{color}"/>')
+        parts.append(_text(52, y + row_h / 2 - 6, name, size=13, weight=600, fill=INK))
+        parts.append(_text(52, y + row_h / 2 + 10, f"priority {rank}", size=11, fill=INK_FAINT))
+        for column, step in enumerate(steps):
+            x = label_w + column * cell_w
+            parts.append(
+                f'<rect x="{x + 2}" y="{y}" width="{cell_w - 4}" height="{row_h - 6}" rx="6"'
+                f' fill="#111827" stroke="{GRID}"/>'
+            )
+            for index, (target, state) in enumerate(step.states[agent_id]):
+                cy = y + 8 + index * 24
+                label = "holds" if state == "ACQUIRED" else "waits"
+                if state == "ACQUIRED":
+                    parts.append(
+                        f'<rect x="{x + 8}" y="{cy}" width="{cell_w - 16}" height="20" rx="10"'
+                        f' fill="{color}" fill-opacity="0.9"/>'
+                    )
+                    parts.append(
+                        _text(
+                            x + 16, cy + 14, f"{label} {target}", size=11, weight=600, fill=SURFACE
+                        )
+                    )
+                else:
+                    parts.append(
+                        f'<rect x="{x + 8.5}" y="{cy + 0.5}" width="{cell_w - 17}" height="19"'
+                        f' rx="10" fill="none" stroke="{color}" stroke-dasharray="4 3"/>'
+                    )
+                    parts.append(_text(x + 16, cy + 14, f"{label} {target}", size=11, fill=INK))
+            if agent_id in step.preempted:
+                parts.append(
+                    f'<rect x="{x + 8.5}" y="{y + 8.5}" width="{cell_w - 17}" height="19" rx="10"'
+                    f' fill="none" stroke="{CRITICAL}"/>'
+                )
+                parts.append(
+                    _text(x + 16, y + 22, "✕ preempted", size=11, weight=600, fill=CRITICAL)
+                )
+    notes_y = top + row_h * len(LOCK_PARTICIPANTS) + 44
+    parts.append(
+        _text(30, notes_y, "Events the lock manager emitted", size=12, weight=600, fill=INK)
+    )
+    for column, step in enumerate(steps):
+        x = label_w + column * cell_w
+        for index, note in enumerate(step.events):
+            fill = CRITICAL if note.startswith("✕") else INK_MUTED
+            parts.append(_text(x + 8, notes_y + index * 16, note, size=10, fill=fill))
+    legend_y = height - 28
+    parts.append(
+        f'<rect x="30" y="{legend_y - 13}" width="44" height="18" rx="9" fill="{INK_MUTED}"/>'
+    )
+    parts.append(_text(84, legend_y, "holds the lock", size=11))
+    parts.append(
+        f'<rect x="200.5" y="{legend_y - 12.5}" width="44" height="17" rx="9" fill="none"'
+        f' stroke="{INK_MUTED}" stroke-dasharray="4 3"/>'
+    )
+    parts.append(_text(254, legend_y, "queued, waiting", size=11))
+    parts.append(
+        _text(
+            380,
+            legend_y,
+            "✕ preempted: lost everything it held or waited for",
+            size=11,
+            fill=CRITICAL,
+        )
+    )
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
     frames = asyncio.run(simulate())
@@ -737,7 +1137,9 @@ def main() -> None:
         raise SystemExit(f"{GIF_PATH.name} is {len(gif)} bytes, over the {MAX_GIF_BYTES} limit")
     GIF_PATH.write_bytes(gif)
     SVG_PATH.write_text(topology_svg())
-    for path in (GIF_PATH, SVG_PATH):
+    CONVERGENCE_PATH.write_text(convergence_svg())
+    LOCKS_PATH.write_text(locks_svg())
+    for path in (GIF_PATH, SVG_PATH, CONVERGENCE_PATH, LOCKS_PATH):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
         print(f"{path.relative_to(ROOT)}  {path.stat().st_size:>9,} bytes  sha256 {digest}")
 

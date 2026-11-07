@@ -41,6 +41,7 @@ recording or a hand-made animation.</sub>
 | **Live multiplayer** | One WebSocket carries state, lock changes, presence and a lossless, sequenced thought stream. Reconnecting clients resume from the last thought they saw. |
 | **Read-only viewers** | Anyone in the tenant can watch and show presence. Only a session's owner can prompt, lock, edit or delete. |
 | **Visual canvas** | `GET /canvas/{id}` serves a self-contained HTML5 canvas: Bézier trails, Hermite dead reckoning, lock overlays, docked thought badges. Under 20 KB, no external requests, hash-based CSP. |
+| **Operable** | Every request and socket gets an `X-Request-ID` that appears in problem documents and log records. `/healthz` for orchestrators, and `/metrics` in the Prometheus format. |
 | **Runnable export** | `GET /api/v1/sessions/{id}/export` compiles the session into a FastAPI + SQLAlchemy + Alembic backend and a Vite + React 19 + Tailwind frontend with a typed API client, as a deterministic ZIP or tar.gz. |
 
 ## Proof of engineering
@@ -50,7 +51,8 @@ as marked.
 
 | Property | Result | Source |
 |---|---|---|
-| Line and branch coverage | **100.00%** across 1,410 tests | Enforced: [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) fails on any regression |
+| Line and branch coverage | **100.00%** across 1,475 tests | Enforced: [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) fails on any regression |
+| Mutation testing | **534 of 548** mutants killed (97.45%) across the locking, patching, hub, auth, motion, compositing and export modules. **All 534** that a test could tell apart are killed; the other 14 are equivalent, each with its reason | Measured: [`scripts/mutation-test.py`](scripts/mutation-test.py), run on demand, about 5 minutes |
 | Canvas frame pacing | **60.0 FPS** on a fixed schedule, p95 interval **18.3 ms**, under a flood of ~600 thoughts/s | Measured. The chaos suite enforces > 54 FPS and p95 < 41.7 ms while a stalled client is evicted |
 | Motion under 50% packet loss | Median error **≈ 1 px**. After a burst, the visible jump stays **under 1/8** of the error the coast accumulated | Enforced: [`tests/unit/test_canvas.py`](tests/unit/test_canvas.py), 5 seeded loss patterns |
 | Python ↔ JavaScript motion parity | **0.000000 px** divergence over 2,400 frames at 50% loss | Measured with an out-of-tree Node harness. Not part of CI, which runs no JavaScript |
@@ -58,6 +60,8 @@ as marked.
 | Lock arbitration | Same winner order for **all 6** arrival orders of three contenders | Enforced: [`tests/integration/test_e2e_chaos.py`](tests/integration/test_e2e_chaos.py) |
 | Zero-loss catch-up | A client dropped mid-burst resumes with **every** missed thought, none repeated | Enforced: chaos suite |
 | Teardown | **No leaked tasks** in `asyncio.all_tasks()` after deleting a session mid-run | Enforced: chaos suite |
+| Bounded memory | 200 edits on a 1 MB bundle once retained 199 MB. Replay history is now held within a per-session byte budget | Enforced: [`tests/unit/test_hardening.py`](tests/unit/test_hardening.py) |
+| Tenant isolation | Per-person limits on sessions, sockets, locks, edits per second and concurrent exports, so no one person can starve the rest | Enforced: hardening suite |
 | Replay integrity | Re-applying the patch log reproduces **every** recorded state hash | Enforced: lifecycle suite |
 
 The test suite opens no network sockets (`pytest-socket` blocks them), makes no model calls, and
@@ -130,6 +134,11 @@ flowchart TB
     commit -- no --> rejected["409 element-lock-conflict"]
 ```
 
+![Lock contention matrix: an owner holds a component while three agents queue for it; on release the Architect is promoted ahead of the Coder and Styler; the Coder then takes the title, the Architect asks for it, and the wait cycle is broken by preempting the Coder](docs/assets/lock-contention-matrix.svg)
+
+<sub>Every cell is the real lock table after each step, produced by running the scenario through
+`AsyncLockManager`.</sub>
+
 Priority never preempts a live holder. It only decides who is promoted next, and who gives way
 when a deadlock forms. The ranking is total, so every replica picks the same winner: priority,
 then the older Lamport timestamp, then the agent id.
@@ -146,6 +155,22 @@ then the older Lamport timestamp, then the agent id.
 
 Locks are path-level. A lock on component `hero` does not cover the site title, which belongs
 to `frontend:document`, or any other component.
+
+Leases last `RASB_LOCK_LEASE_MS` (5 s by default). Agents renew theirs in the background while
+they work. A person's client renews by sending `lock.acquire` again for a target it already
+holds, which costs nothing against its quota. A lease left to lapse is reported as `TIMED_OUT`.
+
+### Motion under packet loss
+
+![Cursor x position over three seconds with two long bursts of packet loss: without convergence the track snaps by hundreds of pixels when a burst ends; with 120 ms convergence it eases back onto the real path](docs/assets/dead-reckoning-convergence.svg)
+
+Telemetry arrives at 30 Hz at best, and the viewer renders at the display's rate. Positions are a
+cubic Hermite spline through the samples that arrived, using their real timestamps, so a dropped
+frame only widens a segment. A burst of losses outlasts any render buffer, so the track coasts,
+decelerating, and the next sample shows how wrong the guess was. Snapping to it is the jump on the
+left. Convergence eases the error out over 120 ms instead. That costs accuracy for a moment, as
+the lower panel shows, and buys a cursor that never teleports. The server and the viewer run the
+same arithmetic, with the constants compiled into the page.
 
 ### Deterministic project synthesis
 
@@ -213,7 +238,9 @@ outright. Identity comes only from the verified token.
 | `prompt` | `text` (1 to 4,096 characters) | owner |
 
 A viewer sending an owner-only message gets an `error` frame with a 403 `permission-denied`
-problem, and nothing changes.
+problem, and nothing changes. Each person may hold or wait for at most `RASB_WS_MAX_LOCKS_PER_USER`
+locks, and commit at most `RASB_WS_MAX_DELTAS_PER_SECOND` deltas across all of their connections.
+Beyond either, the reply is a 429 `capacity-exceeded` problem.
 
 ### Server → client
 
@@ -241,7 +268,7 @@ because the backlog holds only the newest `thought_backlog_size`.
 |---|---|
 | 1000 | Session closed |
 | 1001 | Server shutting down, after delivering what was buffered |
-| 1008 | Authentication required · Token expired · Heartbeat timeout · Rate limit exceeded · Slow Consumer · Invalid connection parameters |
+| 1008 | Authentication required · Too many connections · Token expired · Heartbeat timeout · Rate limit exceeded · Slow Consumer · Invalid connection parameters |
 | 1009 | Message too big |
 | 1011 | Internal error |
 | 4404 | Session not found |
@@ -258,10 +285,17 @@ Every route needs `Authorization: Bearer <token>`. The interactive schema is at 
 | `GET /api/v1/sessions/{id}/export?format=zip` | Compile and download the project. `format` is `zip` or `tar.gz` | `200`, streamed `application/zip` or `application/gzip` |
 | `DELETE /api/v1/sessions/{id}` | End the session, its run, ticker and connections. Owner only | `204` |
 | `GET /canvas/{id}` | The canvas viewer page. No token: it is static, and the socket authenticates | `200` `text/html` |
+| `GET /healthz` | Liveness, for orchestrators. No token, and it reveals nothing | `200` |
+| `GET /metrics` | Gauges and counters in the Prometheus text format | `200` `text/plain` |
 
 Every failure is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem document, served as
 `application/problem+json`. Validation errors list fields and messages, but never echo the
 rejected input. Unexpected failures reveal nothing about their cause.
+
+Every response carries an `X-Request-ID`: the caller's, if it is a plausible id, or a new one.
+Problem documents repeat it as `trace_id`, and every log record emitted while handling the
+request has it as `record.request_id`. Tasks inherit it, so a socket's log lines carry the id of
+the handshake that opened it, and a support ticket quoting a `trace_id` leads straight to them.
 
 ```json
 {
@@ -271,7 +305,8 @@ rejected input. Unexpected failures reveal nothing about their cause.
   "detail": "Agents agent-coder, user:alice are in conflict over urn:site-builder:element:hero.",
   "instance": "/api/v1/sessions/s-…",
   "competing_agent_ids": ["agent-coder", "user:alice"],
-  "resource_uri": "urn:site-builder:element:hero"
+  "resource_uri": "urn:site-builder:element:hero",
+  "trace_id": "7f3c9e2a4b1d4c8e9a6f0b2d5e8c1a3f"
 }
 ```
 
@@ -283,9 +318,9 @@ rejected input. Unexpected failures reveal nothing about their cause.
 | 404 | `session-not-found` |
 | 408 | `lock-acquisition-timeout` |
 | 409 | `element-lock-conflict` · `delta-rejected` · `run-already-active` · `session-already-exists` |
-| 413 | `about:blank`, body too large. Refused from its declared length before any of it is read |
+| 413 | `bundle-too-large`, on creation or when a delta would grow the bundle past `RASB_MAX_BUNDLE_BYTES` · `about:blank` for a body over `RASB_MAX_REQUEST_BYTES`, refused from its declared length before any of it is read |
 | 422 | `ast-syntax-compilation-failure` · `project-synthesis-failure` · `about:blank` for request validation |
-| 429 | `capacity-exceeded` (session or concurrent-run limit) |
+| 429 | `capacity-exceeded`: a gateway-wide or per-person limit on sessions, runs, exports, locks or edits |
 | 500 | `gateway-configuration-failure` · `llm-configuration-failure` · `replay-state-divergence` |
 | 502 | `llm-provider-failure` |
 
@@ -374,6 +409,12 @@ Settings are read from `RASB_`-prefixed environment variables.
 | `RASB_SESSION_TTL_SECONDS` | 3600 | Idle sessions are closed after this |
 | `RASB_LOCK_LEASE_MS` | 5000 | Lock lease, which also bounds how long a request waits |
 | `RASB_GATEWAY_MAX_SESSIONS` · `_MAX_CONCURRENT_RUNS` | 1000 · 8 | Hard limits. A run costs real money |
+| `RASB_GATEWAY_MAX_SESSIONS_PER_USER` | 10 | So that one person cannot take every session |
+| `RASB_GATEWAY_MAX_CONCURRENT_EXPORTS` | 4 | Synthesis is CPU-heavy, and runs in the shared thread pool |
+| `RASB_WS_MAX_CONNECTIONS_PER_USER` | 8 | Sockets per person, across all sessions |
+| `RASB_WS_MAX_LOCKS_PER_USER` · `_MAX_DELTAS_PER_SECOND` | 32 · 10 | Per person. Every snapshot carries every lock, and every edit re-validates the bundle |
+| `RASB_MAX_BUNDLE_BYTES` | 2 MiB | Each commit re-serializes and hashes the whole bundle on the event loop |
+| `RASB_REPLAY_HISTORY_BYTES` | 64 MiB | Per session. Each replay frame holds a full bundle, so the oldest go first |
 | `RASB_THOUGHT_BACKLOG_SIZE` | 1000 | Thoughts retained for reconnecting clients |
 | `RASB_WS_CATCHUP_DEADLINE_MS` | 5000 | How long a client may lag before eviction |
 | `RASB_WS_HEARTBEAT_TIMEOUT_SECONDS` | 60 | Silence allowed before a socket is closed |
@@ -405,6 +446,19 @@ Regenerate the README's assets, deterministically and offline:
 uv run python scripts/generate-demo-assets.py
 ```
 
+Measure how many deliberate faults the tests catch, in parallel copies under `.cache/mutation/`:
+
+```sh
+uv run python scripts/mutation-test.py                 # every target, about 5 minutes
+uv run python scripts/mutation-test.py --list          # just count the mutants
+uv run python scripts/mutation-test.py core/hub.py     # one module
+```
+
+Every applicable operator and literal is mutated. Upper-case module constants are configuration
+and are left alone; the values the documentation promises are pinned by
+[`tests/unit/test_contracts.py`](tests/unit/test_contracts.py) instead. A survivor is either a
+missing test or an equivalent mutant, and equivalents are listed in the script with their reason.
+
 | Path | Contents |
 |---|---|
 | `src/realtime_agentic_site_builder/domain/` | Strict, immutable Pydantic models, hashing, RFC 9457 errors |
@@ -414,14 +468,19 @@ uv run python scripts/generate-demo-assets.py
 | `src/realtime_agentic_site_builder/gateway/` | FastAPI app, auth, WebSocket protocol and connections |
 | `src/realtime_agentic_site_builder/canvas/` | Projection, dead reckoning, compositor, viewer page |
 | `src/realtime_agentic_site_builder/synthesis/` | Project compiler and deterministic archive exporter |
-| `tests/unit/`, `tests/integration/` | Unit suites, and end-to-end lifecycle and chaos scenarios |
+| `tests/unit/`, `tests/integration/` | Unit suites, hardening and contract tests, and end-to-end lifecycle and chaos scenarios |
 
 ## Known limits
 
 - **Five agent nodes, six identities.** The Copywriter has a cursor and a lock priority but no
   node in the graph yet, so it never writes code.
-- **Single writer per session.** Pub/Sub delivers at most once and does not arbitrate writers,
-  so each session needs one writing worker. Other workers serve it as replicas.
+- **Sessions live on one worker.** The hub can run replicas fed over Redis, but the gateway only
+  serves sessions created on its own worker, and a socket routed elsewhere gets close code 4404.
+  Deploy several workers behind routing with session affinity, keyed on the session id in the
+  path. Pub/Sub delivers at most once and does not arbitrate writers, so there is no automatic
+  failover: a worker that goes down takes its sessions with it.
+- **Replay history is a window.** It keeps the newest frames within `RASB_REPLAY_HISTORY_BYTES`.
+  The timeline then starts from the oldest frame kept, which is still a valid base to replay from.
 - **No token issuance.** Tokens are tenant-scoped, and minting them is left to your identity
   provider.
 - **Exports carry no lockfiles.** Generated `package.json` and `pyproject.toml` pin version

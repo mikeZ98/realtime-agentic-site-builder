@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 556" width="1280" height="556" role="img" aria-labelledby="t d">
+<title id="t">Lock contention matrix</title>
+<desc id="d">Eight steps through the real lock manager. Three agents queue for a component an owner holds. On release it passes to the highest priority waiter, the Architect. The Coder then takes the title, the Architect asks for it, and the wait cycle is broken by preempting the lower ranked Coder, which loses everything it held or waited for.</desc>
+<style>text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; } .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }</style>
+<rect width="1280" height="556" rx="14" fill="#0B0F19"/>
+<text x="30.0" y="40.0" font-size="18" font-weight="700" fill="#E5E7EB" text-anchor="start">Two-phase locking under contention</text>
+<text x="30.0" y="62.0" font-size="12" font-weight="400" fill="#64748B" text-anchor="start">Each cell is the real lock table after the step above it. Priority decides who is promoted next and who gives way in a deadlock. It never takes a lock from a live holder.</text>
+<text x="178.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">1</text>
+<text x="178.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Owner takes hero</text>
+<text x="314.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">2</text>
+<text x="314.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Styler queues for</text>
+<text x="314.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">hero</text>
+<text x="450.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">3</text>
+<text x="450.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Coder queues for</text>
+<text x="450.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">hero</text>
+<text x="586.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">4</text>
+<text x="586.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Architect queues</text>
+<text x="586.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">for hero</text>
+<text x="722.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">5</text>
+<text x="722.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Owner releases</text>
+<text x="722.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">hero</text>
+<text x="858.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">6</text>
+<text x="858.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Coder takes the</text>
+<text x="858.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">title</text>
+<text x="994.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">7</text>
+<text x="994.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Architect wants</text>
+<text x="994.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">the title</text>
+<text x="1130.0" y="110.0" font-size="11" font-weight="700" fill="#E5E7EB" text-anchor="start" class="mono">8</text>
+<text x="1130.0" y="126.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Architect releases</text>
+<text x="1130.0" y="140.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">hero</text>
+<circle cx="38" cy="196.0" r="5" fill="#8B5CF6"/>
+<text x="52.0" y="194.0" font-size="13" font-weight="600" fill="#E5E7EB" text-anchor="start">Architect</text>
+<text x="52.0" y="210.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start">priority 90</text>
+<rect x="172" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="308" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="444" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="580" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="586.5" y="176.5" width="119" height="19" rx="10" fill="none" stroke="#8B5CF6" stroke-dasharray="4 3"/>
+<text x="594.0" y="190.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="716" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="722" y="176" width="120" height="20" rx="10" fill="#8B5CF6" fill-opacity="0.9"/>
+<text x="730.0" y="190.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="852" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="858" y="176" width="120" height="20" rx="10" fill="#8B5CF6" fill-opacity="0.9"/>
+<text x="866.0" y="190.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="988" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="994" y="176" width="120" height="20" rx="10" fill="#8B5CF6" fill-opacity="0.9"/>
+<text x="1002.0" y="190.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds document</text>
+<rect x="994" y="200" width="120" height="20" rx="10" fill="#8B5CF6" fill-opacity="0.9"/>
+<text x="1002.0" y="214.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="1124" y="168" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="1130" y="176" width="120" height="20" rx="10" fill="#8B5CF6" fill-opacity="0.9"/>
+<text x="1138.0" y="190.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds document</text>
+<circle cx="38" cy="260.0" r="5" fill="#98F797"/>
+<text x="52.0" y="258.0" font-size="13" font-weight="600" fill="#E5E7EB" text-anchor="start">Owner (person)</text>
+<text x="52.0" y="274.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start">priority 80</text>
+<rect x="172" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="178" y="240" width="120" height="20" rx="10" fill="#98F797" fill-opacity="0.9"/>
+<text x="186.0" y="254.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="308" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="314" y="240" width="120" height="20" rx="10" fill="#98F797" fill-opacity="0.9"/>
+<text x="322.0" y="254.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="444" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="450" y="240" width="120" height="20" rx="10" fill="#98F797" fill-opacity="0.9"/>
+<text x="458.0" y="254.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="580" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="586" y="240" width="120" height="20" rx="10" fill="#98F797" fill-opacity="0.9"/>
+<text x="594.0" y="254.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<rect x="716" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="852" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="988" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="1124" y="232" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<circle cx="38" cy="324.0" r="5" fill="#3B82F6"/>
+<text x="52.0" y="322.0" font-size="13" font-weight="600" fill="#E5E7EB" text-anchor="start">Frontend Coder</text>
+<text x="52.0" y="338.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start">priority 60</text>
+<rect x="172" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="308" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="444" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="450.5" y="304.5" width="119" height="19" rx="10" fill="none" stroke="#3B82F6" stroke-dasharray="4 3"/>
+<text x="458.0" y="318.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="580" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="586.5" y="304.5" width="119" height="19" rx="10" fill="none" stroke="#3B82F6" stroke-dasharray="4 3"/>
+<text x="594.0" y="318.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="716" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="722.5" y="304.5" width="119" height="19" rx="10" fill="none" stroke="#3B82F6" stroke-dasharray="4 3"/>
+<text x="730.0" y="318.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="852" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="858" y="304" width="120" height="20" rx="10" fill="#3B82F6" fill-opacity="0.9"/>
+<text x="866.0" y="318.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds document</text>
+<rect x="858.5" y="328.5" width="119" height="19" rx="10" fill="none" stroke="#3B82F6" stroke-dasharray="4 3"/>
+<text x="866.0" y="342.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="988" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="994.5" y="304.5" width="119" height="19" rx="10" fill="none" stroke="#EF4444"/>
+<text x="1002.0" y="318.0" font-size="11" font-weight="600" fill="#EF4444" text-anchor="start">✕ preempted</text>
+<rect x="1124" y="296" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<circle cx="38" cy="388.0" r="5" fill="#EC4899"/>
+<text x="52.0" y="386.0" font-size="13" font-weight="600" fill="#E5E7EB" text-anchor="start">Styler</text>
+<text x="52.0" y="402.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start">priority 40</text>
+<rect x="172" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="308" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="314.5" y="368.5" width="119" height="19" rx="10" fill="none" stroke="#EC4899" stroke-dasharray="4 3"/>
+<text x="322.0" y="382.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="444" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="450.5" y="368.5" width="119" height="19" rx="10" fill="none" stroke="#EC4899" stroke-dasharray="4 3"/>
+<text x="458.0" y="382.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="580" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="586.5" y="368.5" width="119" height="19" rx="10" fill="none" stroke="#EC4899" stroke-dasharray="4 3"/>
+<text x="594.0" y="382.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="716" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="722.5" y="368.5" width="119" height="19" rx="10" fill="none" stroke="#EC4899" stroke-dasharray="4 3"/>
+<text x="730.0" y="382.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="852" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="858.5" y="368.5" width="119" height="19" rx="10" fill="none" stroke="#EC4899" stroke-dasharray="4 3"/>
+<text x="866.0" y="382.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="988" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="994.5" y="368.5" width="119" height="19" rx="10" fill="none" stroke="#EC4899" stroke-dasharray="4 3"/>
+<text x="1002.0" y="382.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start">waits hero</text>
+<rect x="1124" y="360" width="132" height="58" rx="6" fill="#111827" stroke="#1F2937"/>
+<rect x="1130" y="368" width="120" height="20" rx="10" fill="#EC4899" fill-opacity="0.9"/>
+<text x="1138.0" y="382.0" font-size="11" font-weight="600" fill="#0B0F19" text-anchor="start">holds hero</text>
+<text x="30.0" y="450.0" font-size="12" font-weight="600" fill="#E5E7EB" text-anchor="start">Events the lock manager emitted</text>
+<text x="722.0" y="450.0" font-size="10" font-weight="400" fill="#94A3B8" text-anchor="start">→ Architect gets hero</text>
+<text x="994.0" y="450.0" font-size="10" font-weight="400" fill="#EF4444" text-anchor="start">✕ Coder loses document</text>
+<text x="994.0" y="466.0" font-size="10" font-weight="400" fill="#EF4444" text-anchor="start">✕ Coder loses hero</text>
+<text x="994.0" y="482.0" font-size="10" font-weight="400" fill="#94A3B8" text-anchor="start">→ Architect gets document</text>
+<text x="1130.0" y="450.0" font-size="10" font-weight="400" fill="#94A3B8" text-anchor="start">→ Styler gets hero</text>
+<rect x="30" y="515" width="44" height="18" rx="9" fill="#94A3B8"/>
+<text x="84.0" y="528.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">holds the lock</text>
+<rect x="200.5" y="515.5" width="44" height="17" rx="9" fill="none" stroke="#94A3B8" stroke-dasharray="4 3"/>
+<text x="254.0" y="528.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">queued, waiting</text>
+<text x="380.0" y="528.0" font-size="11" font-weight="400" fill="#EF4444" text-anchor="start">✕ preempted: lost everything it held or waited for</text>
+</svg>
