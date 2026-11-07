@@ -10,7 +10,11 @@ from realtime_agentic_site_builder.domain.swarm import AgentAction
 
 SYSTEM_PROMPT: Final = (
     "You write one FastAPI endpoint handler. Return Python source whose top level defines a single "
-    "async function. Do not include imports for the framework or the route decorator."
+    "async function. Do not include imports for the framework or the route decorator. Already in "
+    "scope: Annotated, Any, datetime, uuid, Depends, HTTPException, Query, Request, Response, "
+    "status, select, models (the ORM classes), get_session, DbSession, and every schema by its "
+    "model name. Take the database session as a parameter annotated DbSession and commit it "
+    "yourself. Anything else you import must come from the standard library."
 )
 
 

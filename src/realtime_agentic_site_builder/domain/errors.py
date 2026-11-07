@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model
 PROBLEM_JSON_MEDIA_TYPE: Final = "application/problem+json"
 PROBLEM_TYPE_BASE: Final = "https://github.com/mikeZ98/realtime-agentic-site-builder/problems/"
 MAX_SNIPPET_LENGTH: Final = 2000
+MAX_REPORTED_ISSUES: Final = 50
 
 _EXTENSION_NAME: Final = TypeAdapter(Annotated[str, Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{2,}$")])
 _EXTENSION_VALUE: Final = TypeAdapter(JsonValue)
@@ -223,6 +224,21 @@ class DeltaRejectedError(SiteBuilderError):
             f"Delta {delta_seq} was rejected by session {session_id}: {reason}.",
             instance=instance,
             extensions={"session_id": session_id, "delta_seq": delta_seq},
+        )
+
+
+class ProjectSynthesisError(SiteBuilderError):
+    """A bundle that is valid to edit, but would not produce a project that builds and starts."""
+
+    status: ClassVar[int] = 422
+    title: ClassVar[str] = "Project synthesis failure"
+    slug: ClassVar[str] = "project-synthesis-failure"
+
+    def __init__(self, issues: Sequence[str], *, instance: str | None = None) -> None:
+        super().__init__(
+            f"The project cannot be exported until {len(issues)} problem(s) are fixed.",
+            instance=instance,
+            extensions={"issues": list(issues[:MAX_REPORTED_ISSUES])},
         )
 
 

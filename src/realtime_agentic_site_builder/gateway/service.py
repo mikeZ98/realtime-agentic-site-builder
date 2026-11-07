@@ -12,7 +12,7 @@ from typing import Annotated, Any, Final, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -62,6 +62,7 @@ from realtime_agentic_site_builder.gateway.connection import (
 from realtime_agentic_site_builder.gateway.protocol import PromptText, SyncFrame
 from realtime_agentic_site_builder.simulation.controller import CursorSimulator
 from realtime_agentic_site_builder.simulation.ticker import SimulationTicker, monotonic_ms
+from realtime_agentic_site_builder.synthesis.exporter import ArchiveFormat, export_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -472,6 +473,36 @@ async def get_timeline(session_id: str, service: Service) -> Response:
     )
     # A long session's log holds a full bundle per frame, which is too much to encode on the loop.
     return Response(await asyncio.to_thread(response.model_dump_json), media_type=JSON_MEDIA_TYPE)
+
+
+@router.get(
+    "/api/v1/sessions/{session_id}/export",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "The project as a reproducible archive.",
+            "content": {"application/zip": {}, "application/gzip": {}},
+        }
+    },
+    dependencies=[Depends(_identity)],
+)
+async def export_session(
+    session_id: str,
+    service: Service,
+    archive_format: Annotated[ArchiveFormat, Query(alias="format")] = ArchiveFormat.ZIP,
+) -> Response:
+    bundle = service.hub.latest_snapshot(session_id).bundle_state
+    # Finished before the response starts, so a bundle that cannot be exported still gets a problem
+    # document. Compiling and compressing a large project is too much work for the event loop.
+    archive = await asyncio.to_thread(export_bundle, bundle, archive_format)
+    return StreamingResponse(
+        archive.chunks(),
+        media_type=archive.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{archive.filename}"',
+            "Content-Length": str(len(archive.content)),
+        },
+    )
 
 
 @router.delete("/api/v1/sessions/{session_id}", status_code=204)

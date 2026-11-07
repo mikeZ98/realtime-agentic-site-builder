@@ -736,6 +736,7 @@ def assert_problem(response: httpx.Response, status: int) -> dict[str, Any]:
         ("POST", SESSIONS),
         ("GET", f"{SESSIONS}/any"),
         ("GET", f"{SESSIONS}/any/timeline"),
+        ("GET", f"{SESSIONS}/any/export"),
         ("DELETE", f"{SESSIONS}/any"),
     ],
 )
