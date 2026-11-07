@@ -31,7 +31,7 @@ from realtime_agentic_site_builder.core.lock_manager import (
     AsyncLockManager,
     LockEvent,
 )
-from realtime_agentic_site_builder.core.patch_engine import replay_operations
+from realtime_agentic_site_builder.core.patch_engine import bundle_size, replay_operations
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
 from realtime_agentic_site_builder.domain.blueprint import (
     BoundingBox,
@@ -226,6 +226,20 @@ async def test_a_trimmed_frame_cannot_be_forked_either() -> None:
         assert response.status_code == 404
         assert response.json()["earliest"] == 2
         await socket.drop()
+
+
+async def test_a_fork_of_a_trimmed_window_starts_at_its_oldest_frame_and_ends_where_asked() -> None:
+    sizes = [bundle_size(frame.bundle_state) for frame in (await recorded(list("ABCD"))).snapshots]
+    hub = SwarmSessionHub(
+        Settings(gateway_secret=SecretStr("x" * 40), replay_history_bytes=sum(sizes[-3:]))
+    )
+    await commit_titles(hub, list("ABCD"))
+    assert [frame.frame_seq for frame in hub.timeline("s1").snapshots] == [2, 3, 4]
+    await hub.fork_session("s1", "fork", 3)
+    fork = hub.timeline("fork")
+    assert [frame.frame_seq for frame in fork.snapshots] == [2, 3]
+    assert [delta.delta_seq for delta in fork.deltas] == [2]
+    await hub.shutdown()
 
 
 async def test_forking_needs_a_token_and_counts_against_the_forkers_session_limit() -> None:
@@ -576,6 +590,7 @@ async def test_a_real_swarm_run_satisfies_every_invariant_over_http() -> None:
     assert response.status_code == 200
     assert report["holds"] is True
     assert {item["name"] for item in report["invariants"]} == {
+        "log-complete",
         "frames-contiguous",
         "deltas-ordered",
         "mutual-exclusion",
@@ -599,6 +614,13 @@ async def test_verification_shares_the_heavy_work_limit_and_needs_a_token() -> N
 
 async def recorded(titles: list[str]) -> ReplayTimeline:
     hub = SwarmSessionHub(Settings(gateway_secret=SecretStr("x" * 40)))
+    await commit_titles(hub, titles)
+    timeline = hub.timeline("s1")
+    await hub.shutdown()
+    return timeline
+
+
+async def commit_titles(hub: SwarmSessionHub, titles: list[str]) -> None:
     await hub.create_session("s1", FullstackProjectBundle.model_validate(bundle()))
     await hub.lock_manager("s1").acquire(DOCUMENT, "agent-coder", 60, hub.now_ms())
     for index, title in enumerate(titles):
@@ -616,9 +638,6 @@ async def recorded(titles: list[str]) -> ReplayTimeline:
                 }
             ),
         )
-    timeline = hub.timeline("s1")
-    await hub.shutdown()
-    return timeline
 
 
 def tampered(timeline: ReplayTimeline, **changes: Any) -> ReplayTimeline:
@@ -650,6 +669,28 @@ async def test_a_gap_in_frames_and_reordered_deltas_are_named() -> None:
     assert found["frames-contiguous"] == ("frame 7 follows frame 1", "frame 3 follows frame 7")
     assert found["deltas-ordered"] == ("delta 0 follows delta 1",)
     assert "replay-exact" in found, "reordered deltas no longer replay to the recorded state"
+
+
+async def test_a_repeated_delta_number_and_a_truncated_log_are_named() -> None:
+    timeline = await recorded(["A", "B", "C"])
+    repeated = timeline.deltas[2].model_copy(update={"delta_seq": 1})
+    found = violated(tampered(timeline, deltas=(*timeline.deltas[:2], repeated)))
+    assert found["deltas-ordered"] == ("delta 1 follows delta 1",)
+
+    truncated = violated(tampered(timeline, deltas=timeline.deltas[:2]))
+    assert truncated == {"log-complete": ("3 frames follow the first, but 2 deltas were recorded",)}
+    surplus = violated(tampered(timeline, snapshots=timeline.snapshots[:3]))
+    assert surplus["log-complete"] == ("2 frames follow the first, but 3 deltas were recorded",)
+
+
+async def test_holding_some_other_element_does_not_cover_a_commit() -> None:
+    timeline = await recorded(["A"])
+    elsewhere = timeline.snapshots[1].active_locks[0].model_copy(update={"target_id": "hero"})
+    frame = timeline.snapshots[1].model_copy(update={"active_locks": (elsewhere,)})
+    found = violated(tampered(timeline, snapshots=(timeline.snapshots[0], frame)))
+    assert found["commits-locked"] == (
+        f"frame 1: agent-coder committed to {DOCUMENT} without holding it",
+    )
 
 
 async def test_two_holders_of_one_element_are_named() -> None:

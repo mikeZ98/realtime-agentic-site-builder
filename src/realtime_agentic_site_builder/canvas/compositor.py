@@ -146,7 +146,7 @@ class ThoughtEntry(DomainModel):
     # What the HUD reads: which graph node started or ended, the critic's verdict, and spend.
     node: str | None = None
     approved: bool | None = None
-    tokens: int = 0
+    tokens: int
     cost_usd: float | None = None
 
 

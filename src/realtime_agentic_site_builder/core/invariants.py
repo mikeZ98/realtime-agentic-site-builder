@@ -4,6 +4,7 @@ Each property is checked against a session's recorded history, never against wha
 to do, so a defect anywhere upstream (the lock manager, the patch engine, the hub, a replica's
 adoption of another worker's commits) shows up as a named, located violation:
 
+- ``log-complete``: every frame after the first has exactly one delta that produced it.
 - ``frames-contiguous``: frame numbers rise by exactly one, with no gap and no repeat.
 - ``deltas-ordered``: delta sequence numbers strictly increase.
 - ``mutual-exclusion``: no frame records two holders of one element.
@@ -11,7 +12,9 @@ adoption of another worker's commits) shows up as a named, located violation:
 - ``leases-live``: and that hold had not lapsed at the moment of the commit.
 - ``replay-exact``: re-applying the log from its first frame reproduces every recorded hash.
 
-The checks are pure and run in time linear in the log, plus one patch application per delta.
+The checks are pure and run in time linear in the log, plus one patch application per delta. A
+log with frames and deltas out of step is reported, never raised: the other checks pair what
+they can, from the start.
 """
 
 from collections import Counter
@@ -42,6 +45,12 @@ class InvariantReport(DomainModel):
     invariants: tuple[InvariantResult, ...]
 
 
+def _log_complete(timeline: ReplayTimeline) -> Iterator[str]:
+    following, deltas = len(timeline.snapshots) - 1, len(timeline.deltas)
+    if deltas != following:
+        yield f"{following} frames follow the first, but {deltas} deltas were recorded"
+
+
 def _frames_contiguous(timeline: ReplayTimeline) -> Iterator[str]:
     for earlier, later in pairwise(timeline.snapshots):
         if later.frame_seq != earlier.frame_seq + 1:
@@ -65,7 +74,7 @@ def _mutual_exclusion(timeline: ReplayTimeline) -> Iterator[str]:
 
 
 def _commits(timeline: ReplayTimeline, *, require_live: bool) -> Iterator[str]:
-    for delta, frame in zip(timeline.deltas, timeline.snapshots[1:], strict=True):
+    for delta, frame in zip(timeline.deltas, timeline.snapshots[1:], strict=False):
         hold = next(
             (
                 lock
@@ -94,7 +103,7 @@ def _replay_exact(timeline: ReplayTimeline, engine: PatchEngine) -> Iterator[str
     if bundle.state_hash() != timeline.snapshots[0].bundle_hash:
         yield f"frame {timeline.snapshots[0].frame_seq} does not match its own hash"
         return
-    for delta, frame in zip(timeline.deltas, timeline.snapshots[1:], strict=True):
+    for delta, frame in zip(timeline.deltas, timeline.snapshots[1:], strict=False):
         try:
             bundle, state_hash = engine.apply_patch(bundle, delta)
         except SiteBuilderError as error:
@@ -110,6 +119,7 @@ def verify_timeline(timeline: ReplayTimeline, engine: PatchEngine | None = None)
     patcher = engine or PatchEngine()
     frames, deltas = len(timeline.snapshots), len(timeline.deltas)
     checks: tuple[tuple[str, int, Callable[[], Iterator[str]]], ...] = (
+        ("log-complete", frames, lambda: _log_complete(timeline)),
         ("frames-contiguous", frames, lambda: _frames_contiguous(timeline)),
         ("deltas-ordered", deltas, lambda: _deltas_ordered(timeline)),
         ("mutual-exclusion", frames, lambda: _mutual_exclusion(timeline)),

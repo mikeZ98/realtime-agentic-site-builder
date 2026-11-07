@@ -38,18 +38,26 @@ WORKSPACE: Final = ROOT / ".cache" / "mutation"
 
 # Each module is mutated against the tests that are meant to pin it down.
 TARGETS: Final[dict[str, tuple[str, ...]]] = {
-    "core/lock_manager.py": ("tests/unit/test_core.py", "tests/unit/test_contracts.py"),
+    "core/lock_manager.py": (
+        "tests/unit/test_core.py",
+        "tests/unit/test_breakthrough.py",
+        "tests/unit/test_model_checking.py",
+        "tests/unit/test_contracts.py",
+    ),
     "core/patch_engine.py": (
         "tests/unit/test_core.py",
         "tests/unit/test_hardening.py",
+        "tests/unit/test_mirror.py",
         "tests/unit/test_contracts.py",
     ),
     "core/hub.py": (
         "tests/unit/test_core.py",
         "tests/unit/test_hardening.py",
         "tests/unit/test_gateway.py",
+        "tests/unit/test_breakthrough.py",
         "tests/unit/test_contracts.py",
     ),
+    "core/invariants.py": ("tests/unit/test_breakthrough.py",),
     "domain/swarm.py": (
         "tests/unit/test_schemas.py",
         "tests/unit/test_core.py",
@@ -57,7 +65,13 @@ TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "gateway/auth.py": ("tests/unit/test_gateway.py", "tests/unit/test_contracts.py"),
     "canvas/projection.py": ("tests/unit/test_canvas.py", "tests/unit/test_contracts.py"),
-    "canvas/compositor.py": ("tests/unit/test_canvas.py", "tests/unit/test_contracts.py"),
+    "canvas/compositor.py": (
+        "tests/unit/test_canvas.py",
+        "tests/unit/test_breakthrough.py",
+        "tests/unit/test_mirror.py",
+        "tests/unit/test_contracts.py",
+    ),
+    "canvas/mirror.py": ("tests/unit/test_mirror.py", "tests/unit/test_breakthrough.py"),
     "synthesis/exporter.py": ("tests/unit/test_synthesis.py", "tests/unit/test_contracts.py"),
 }
 # Reviewed survivors no test could ever kill, keyed by module, source line and mutation.
@@ -67,6 +81,8 @@ _REPLAY_LOOP = (
 )
 _DESCRIBE = "first = error.errors(include_url=False, include_context=False, include_input=False)[0]"
 _SEGMENT = "earlier, later = next(pair for pair in pairwise(self._knots) if t_ms <= pair[1].t_ms)"
+_FORK_LOOP = "for delta, frame, size in zip(deltas, frames[1:], sizes[1:], strict=True):"
+_DIFF_LOOP = "for index, (before, after) in enumerate(zip(old, new, strict=True)):"
 EQUIVALENT: Final[dict[tuple[str, str, str], str]] = {
     ("core/hub.py", _STUB, "False -> True"): "a default in a Protocol stub, which never runs",
     ("core/hub.py", _STUB, "0.0 -> 1.0"): "a default in a Protocol stub, which never runs",
@@ -75,6 +91,12 @@ EQUIVALENT: Final[dict[tuple[str, str, str], str]] = {
     ),
     ("core/hub.py", "self.reserved_delta_seq = -1", "1 -> 2"): (
         "max() with last_delta_seq, at least -1, makes -1 and -2 reserve the same number"
+    ),
+    ("core/hub.py", _FORK_LOOP, "True -> False"): (
+        "all three are sliced to the same count from the session's paired logs"
+    ),
+    ("canvas/mirror.py", _DIFF_LOOP, "True -> False"): (
+        "the branch is taken only after checking that both lists have the same length"
     ),
     ("core/patch_engine.py", _REPLAY_LOOP, "True -> False"): (
         "both sequences are built from the same operations, so their lengths always match"
