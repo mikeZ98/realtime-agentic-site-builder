@@ -1,5 +1,6 @@
 import ast
 import builtins
+import dataclasses
 import gzip
 import hashlib
 import io
@@ -50,7 +51,6 @@ from realtime_agentic_site_builder.synthesis.exporter import (
     CHUNK_BYTES,
     EPOCH_DATE_TIME,
     EPOCH_SECONDS,
-    FILE_MODE,
     ArchiveFormat,
     ProjectArchive,
     build_tar_gz,
@@ -1143,7 +1143,8 @@ def test_zip_entries_are_sorted_with_normalized_metadata() -> None:
             assert info.filename.startswith("acme-site-1/")
             assert ".." not in info.filename.split("/")
             assert info.date_time == EPOCH_DATE_TIME
-            assert info.external_attr == FILE_MODE << 16
+            # Literal on purpose: comparing against the constant itself could never fail.
+            assert info.external_attr == 0o644 << 16
             assert info.create_system == 3
             assert info.compress_type == zipfile.ZIP_DEFLATED
         main = opened.read("acme-site-1/backend/app/main.py").decode()
@@ -1163,7 +1164,7 @@ def test_tar_gz_entries_are_sorted_with_normalized_metadata() -> None:
         assert names == sorted(names)
         for member in members:
             assert member.mtime == EPOCH_SECONDS
-            assert member.mode == FILE_MODE
+            assert member.mode == 0o644
             assert (member.uid, member.gid, member.uname, member.gname) == (0, 0, "", "")
         extracted = opened.extractfile("acme-site-1/backend/app/main.py")
         assert extracted is not None
@@ -1198,9 +1199,16 @@ def test_exporting_touches_no_file(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_chunks_reassemble_to_the_archive_within_the_chunk_size() -> None:
     content = b"x" * (CHUNK_BYTES * 2 + 5)
     chunks = list(ProjectArchive("a.zip", "application/zip", content).chunks())
-    assert [len(chunk) for chunk in chunks] == [CHUNK_BYTES, CHUNK_BYTES, 5]
+    assert [len(chunk) for chunk in chunks] == [65_536, 65_536, 5]
     assert b"".join(chunks) == content
     assert list(ProjectArchive("a.zip", "application/zip", b"").chunks()) == []
+
+
+def test_an_archive_cannot_change_once_built() -> None:
+    archive = ProjectArchive("a.zip", "application/zip", b"zip")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        archive.content = b"tampered"  # type: ignore[misc]
+    assert not hasattr(archive, "__dict__"), "slotted, so no attribute can be added either"
 
 
 def test_project_type_is_what_the_engine_returns() -> None:
