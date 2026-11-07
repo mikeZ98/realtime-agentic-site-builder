@@ -52,10 +52,17 @@ from realtime_agentic_site_builder.canvas.projection import (
 from realtime_agentic_site_builder.canvas.viewer import (
     CLIENT_BUFFER_MS,
     CONTENT_SECURITY_POLICY,
+    GLOW_DECAY_MS,
+    GRAPH_NODES,
     HEARTBEAT_MS,
+    HISTORY_CHECKPOINT_EVERY,
     MAX_VIEWER_BYTES,
+    PROBE_INTERVAL_MS,
+    SPRING_DAMPING,
+    SPRING_STIFFNESS,
     VIEWER_BYTES,
     VIEWER_HTML,
+    spring_settle_ms,
 )
 from realtime_agentic_site_builder.config import Settings
 from realtime_agentic_site_builder.core.hub import (
@@ -1080,9 +1087,48 @@ def test_viewer_takes_its_token_from_the_fragment_and_hands_it_over_as_a_subprot
     assert not re.search(r"localStorage|sessionStorage|document\.cookie", script)
 
 
-def test_viewer_only_ever_sends_read_and_presence_messages() -> None:
-    sent = set(re.findall(r'send\(\{ type: "([a-z.]+)"', script_of()))
-    assert sent == {"ping", "cursor", "select"}
+def test_viewer_sends_presence_and_nothing_else_but_the_owners_override() -> None:
+    script = script_of()
+    sent = set(re.findall(r'send\(\{ type: "([a-z.]+)"', script))
+    assert sent == {"ping", "cursor", "select", "lock.override", "lock.release"}
+    # The page never edits, prompts or queues for a lock. Overriding is the owner's alone, which
+    # the server enforces whatever any page sends; the page only hides the control from others.
+    assert "if (!me || !me.is_owner) return null;" in script
+    assert '$("owner").hidden = !message.is_owner;' in script
+
+
+def test_viewer_runs_the_servers_graph_spring_and_history_constants() -> None:
+    script = script_of()
+    assert f"GRAPH_NODES = {json.dumps(list(GRAPH_NODES))}" in script
+    assert GRAPH_NODES == ("planner", "coder", "backend", "styler", "critic")
+    assert f"SPRING_K = {SPRING_STIFFNESS}, SPRING_D = {SPRING_DAMPING}" in script
+    assert f"CHECKPOINT = {HISTORY_CHECKPOINT_EVERY}" in script
+    assert f"GLOW_MS = {GLOW_DECAY_MS}" in script
+    assert f"PROBE_MS = {PROBE_INTERVAL_MS}" in script
+
+
+def test_the_spring_rings_visibly_then_settles_before_the_next_frame_of_commits() -> None:
+    damping_ratio = SPRING_DAMPING / (2 * math.sqrt(SPRING_STIFFNESS))
+    assert 0.3 < damping_ratio < 0.7, "underdamped enough to read as a bounce, not a wobble"
+    assert spring_settle_ms() < 600
+    assert spring_settle_ms(0.5) < spring_settle_ms(0.02)
+
+
+def test_viewer_keeps_its_token_out_of_every_url_it_requests() -> None:
+    script = script_of()
+    assert "headers: { Authorization: `Bearer ${token}` }" in script
+    assert 'credentials: "omit"' in script
+    assert not re.search(r"[?&]token=", script)
+    # The one URL that carries it is a fork's, in the fragment, which no server ever receives.
+    assert re.findall(r"#token=", script) == ["#token="]
+
+
+def test_viewer_mirrors_the_site_without_running_any_of_its_code() -> None:
+    script = script_of()
+    assert "component.code" not in script and ".code" not in script.replace("event.code", "")
+    assert "iframe" not in VIEWER_HTML
+    assert "structuredClone(root)" in script, "a delta applies whole or not at all"
+    assert 'new Set(["__proto__", "constructor", "prototype"])' in script
 
 
 # --- the viewer route -----------------------------------------------------------------------

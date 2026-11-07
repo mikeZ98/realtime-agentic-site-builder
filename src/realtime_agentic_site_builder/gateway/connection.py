@@ -14,6 +14,7 @@ from realtime_agentic_site_builder.canvas.compositor import (
     CanvasCompositor,
     CanvasOverride,
     CanvasScene,
+    Layout,
     canvas_delta,
     participant,
     thought_entry,
@@ -341,9 +342,12 @@ class CanvasConnection(ClientConnection):
         listener: SessionListener,
         initial_frames: tuple[str, ...],
         compositor: CanvasCompositor,
+        mirror: tuple[int, Layout],
     ) -> None:
         super().__init__(service, websocket, identity, session_id, listener, initial_frames)
         self._compositor = compositor
+        # The frame and layout this viewer's mirror holds, which every commit is described against.
+        self._mirror_seq, self._mirror = mirror
         self._scene: CanvasScene | None = None
         self._interval_s = 1 / self._hub.settings.broadcast_fps
 
@@ -361,7 +365,7 @@ class CanvasConnection(ClientConnection):
                 if isinstance(event, ThoughtEvent):
                     thoughts.append(thought_entry(event).model_dump_json())
                 elif isinstance(event, StateEvent):
-                    thoughts.append(canvas_delta(event).model_dump_json())
+                    thoughts.append(self._describe(event))
                 elif isinstance(event, LockNotice) and event.event.kind is LockEventKind.OVERRIDDEN:
                     override = CanvasOverride(
                         target_id=event.event.lock.target_id,
@@ -377,6 +381,15 @@ class CanvasConnection(ClientConnection):
             # every interval. After falling behind, it resumes the schedule from now.
             next_frame_at = max(next_frame_at + self._interval_s, loop.time())
             await asyncio.sleep(next_frame_at - loop.time())
+
+    def _describe(self, event: StateEvent) -> str:
+        seq = event.snapshot.frame_seq
+        after = event.snapshot.bundle_state.frontend.model_dump(mode="json")
+        # After a gap the mirror holds an older layout, so corrections would be wrong. The viewer
+        # sees the gap in the frame numbers too, and rebuilds from the history route instead.
+        mirror = (self._mirror, after) if seq == self._mirror_seq + 1 else None
+        self._mirror_seq, self._mirror = seq, after
+        return canvas_delta(event, mirror).model_dump_json()
 
     def _next_frame(self, now_ms: int) -> str:
         locks = self._hub.lock_manager(self.session_id).active_locks()

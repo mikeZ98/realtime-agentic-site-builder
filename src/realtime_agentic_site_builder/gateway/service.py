@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from itertools import pairwise
 from typing import Annotated, Any, Final, Literal, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, WebSocket
@@ -32,6 +33,7 @@ from realtime_agentic_site_builder.canvas.compositor import (
     CanvasCompositor,
     thought_entry,
 )
+from realtime_agentic_site_builder.canvas.mirror import corrections
 from realtime_agentic_site_builder.canvas.viewer import viewer_response
 from realtime_agentic_site_builder.config import Settings, get_settings
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
@@ -66,6 +68,7 @@ from realtime_agentic_site_builder.domain.swarm import (
     AgentRole,
     AgentThoughtStream,
     ElementLock,
+    PatchOperation,
     ReplayTimeline,
     StreamDelta,
     SwarmSnapshot,
@@ -120,6 +123,8 @@ class HistoryEntry(DomainModel):
     timestamp_ms: int
     bundle_hash: str
     delta: StreamDelta
+    # Applied after a frontend delta's patches, these give exactly the layout that committed.
+    corrections: tuple[PatchOperation, ...]
     locks: tuple[ElementLock, ...]
 
 
@@ -136,6 +141,7 @@ class HistoryResponse(DomainModel):
 
 def history_of(timeline: ReplayTimeline) -> HistoryResponse:
     base = timeline.snapshots[0]
+    layouts = [frame.bundle_state.frontend.model_dump(mode="json") for frame in timeline.snapshots]
     return HistoryResponse(
         session_id=timeline.session_id,
         base_frame_seq=base.frame_seq,
@@ -148,9 +154,16 @@ def history_of(timeline: ReplayTimeline) -> HistoryResponse:
                 timestamp_ms=frame.timestamp_ms,
                 bundle_hash=frame.bundle_hash,
                 delta=delta,
+                corrections=corrections(
+                    before,
+                    delta.patches if delta.target_domain == "frontend" else (),
+                    after,
+                ),
                 locks=frame.active_locks,
             )
-            for delta, frame in zip(timeline.deltas, timeline.snapshots[1:], strict=True)
+            for delta, frame, (before, after) in zip(
+                timeline.deltas, timeline.snapshots[1:], pairwise(layouts), strict=True
+            )
         ),
     )
 
@@ -498,6 +511,7 @@ class GatewayService:
                 *(thought_entry(event).model_dump_json() for event in replay),
             ),
             compositor,
+            (snapshot.frame_seq, snapshot.bundle_state.frontend.model_dump(mode="json")),
         )
 
     async def serve(

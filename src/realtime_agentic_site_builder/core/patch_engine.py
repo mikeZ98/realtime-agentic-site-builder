@@ -2,7 +2,8 @@
 
 import copy
 import re
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -160,6 +161,16 @@ def _apply_operation(document: Any, operation: PatchOperation, budget: int) -> i
     elif not _json_equal(_resolve(document, tokens), thaw_json(operation.value)):
         raise _PatchFailure(f"test failed at {operation.path!r}")
     return budget
+
+
+def replay_operations(document: Any, operations: Iterable[PatchOperation]) -> None:
+    """Apply operations in place as a commit does, before its stamping and validation.
+
+    Only for operations that already committed, whose size the engine has already bounded. A
+    viewer's mirror does the same, so this is what it holds after a delta, before corrections.
+    """
+    for operation in operations:
+        _apply_operation(document, operation, sys.maxsize)
 
 
 def _stamp_component(raw: dict[str, Any], previous: ComponentNode | None) -> None:

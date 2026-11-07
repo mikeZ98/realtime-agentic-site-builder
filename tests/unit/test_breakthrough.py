@@ -18,7 +18,12 @@ from e2e_support import (
 from pydantic import SecretStr
 
 from realtime_agentic_site_builder.agents.provider import MockLLMProvider
-from realtime_agentic_site_builder.canvas.compositor import CanvasCompositor, thought_entry
+from realtime_agentic_site_builder.canvas.compositor import (
+    CanvasCompositor,
+    canvas_delta,
+    participant,
+    thought_entry,
+)
 from realtime_agentic_site_builder.config import ModelPrice, Settings
 from realtime_agentic_site_builder.core.hub import SwarmSessionHub, ThoughtEvent
 from realtime_agentic_site_builder.core.invariants import verify_timeline
@@ -26,7 +31,7 @@ from realtime_agentic_site_builder.core.lock_manager import (
     AsyncLockManager,
     LockEvent,
 )
-from realtime_agentic_site_builder.core.patch_engine import _apply_operation
+from realtime_agentic_site_builder.core.patch_engine import replay_operations
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
 from realtime_agentic_site_builder.domain.blueprint import (
     BoundingBox,
@@ -38,6 +43,7 @@ from realtime_agentic_site_builder.domain.swarm import (
     AgentRole,
     AgentThoughtStream,
     LockState,
+    PatchOperation,
     ReplayTimeline,
     StreamDelta,
 )
@@ -251,25 +257,21 @@ async def test_a_session_id_cannot_be_forked_into_twice() -> None:
 
 
 def frontend_at(history: dict[str, Any], frame_seq: int) -> dict[str, Any]:
-    """Rebuild the layout at a frame the way the viewer's scrubber does: patch the base forward."""
+    """Rebuild the layout at a frame the way the viewer's scrubber does: patch the base forward.
+
+    Nothing but RFC 6902 runs here, as in the page: each frontend delta's patches, then the
+    corrections that carry the server's stamping and normalization.
+    """
     document = {"frontend": copy.deepcopy(history["base_frontend"])}
     for entry in history["entries"]:
         if entry["frame_seq"] > frame_seq:
             break
-        if entry["delta"]["target_domain"] == "frontend":
-            delta = StreamDelta.model_validate(entry["delta"])
-            for operation in delta.patches:
-                _apply_operation(document, operation, 1 << 30)
+        delta = StreamDelta.model_validate(entry["delta"])
+        patches = delta.patches if delta.target_domain == "frontend" else ()
+        fixes = [PatchOperation.model_validate(fix) for fix in entry["corrections"]]
+        replay_operations(document, (*patches, *fixes))
     rebuilt: dict[str, Any] = document["frontend"]
     return rebuilt
-
-
-def layout(frontend: dict[str, Any]) -> list[tuple[Any, ...]]:
-    """What the DOM mirror draws. Checksums are the server's bookkeeping, and are left out."""
-    return [
-        (item["id"], item["title"], item["component_type"], tuple(item["box"].values()))
-        for item in frontend["components"]
-    ] + [(frontend["title"], frontend["theme"])]
 
 
 async def test_history_lets_a_client_rebuild_the_layout_at_every_frame_held() -> None:
@@ -284,8 +286,13 @@ async def test_history_lets_a_client_rebuild_the_layout_at_every_frame_held() ->
                 "request_id": "move",
                 "target_domain": "frontend",
                 "target_id": "footer",
+                # Committed as "Bye & thanks...": the server unescapes and NFKC-normalizes it.
                 "patches": [
-                    {"op": "replace", "path": "/frontend/components/1/title", "value": "Bye"}
+                    {
+                        "op": "replace",
+                        "path": "/frontend/components/1/title",
+                        "value": "Bye &amp; thanks\u2026",
+                    }
                 ],
             }
         )
@@ -299,7 +306,12 @@ async def test_history_lets_a_client_rebuild_the_layout_at_every_frame_held() ->
         assert [entry["frame_seq"] for entry in history["entries"]] == [1, 2, 3]
         for frame in timeline.snapshots:
             expected = frame.bundle_state.frontend.model_dump(mode="json")
-            assert layout(frontend_at(history, frame.frame_seq)) == layout(expected)
+            assert frontend_at(history, frame.frame_seq) == expected
+        assert timeline.snapshots[-1].bundle_state.frontend.components[1].title == "Bye & thanks..."
+        assert {fix["path"] for fix in history["entries"][-1]["corrections"]} == {
+            "/frontend/components/1/title",
+            "/frontend/components/1/ast_version",
+        }, "the checksum covers code and box, so a new title leaves it alone"
         assert [entry["bundle_hash"] for entry in history["entries"]] == [
             frame.bundle_hash for frame in timeline.snapshots[1:]
         ]
@@ -436,6 +448,8 @@ async def test_canvas_viewers_get_the_layout_and_then_every_commit_as_a_patch() 
         await reply_after_edit(owner, "Live", "d")
         delta = await viewer.next_of("canvas.delta")
         assert (delta["frame_seq"], delta["agent_id"]) == (1, "user:alice")
+        assert delta["target_id"] == DOCUMENT
+        assert delta["color"] == participant("user:alice").color
         assert delta["patches"] == [{"op": "replace", "path": "/frontend/title", "value": "Live"}]
         frame = await viewer.next_of("canvas")
         if "scene" in frame:
@@ -463,11 +477,10 @@ async def test_backend_commits_reach_the_timeline_without_their_patches() -> Non
             }
         ),
     )
-    from realtime_agentic_site_builder.canvas.compositor import canvas_delta
-
     event = listener.poll()
     sent = canvas_delta(event)  # type: ignore[arg-type]
     assert (sent.target_domain, sent.patches, sent.frame_seq) == ("backend", (), 1)
+    assert (sent.target_id, sent.color) == ("backend:document", participant("agent-backend").color)
     await hub.shutdown()
 
 

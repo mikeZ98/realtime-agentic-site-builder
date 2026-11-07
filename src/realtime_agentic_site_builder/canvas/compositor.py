@@ -5,9 +5,10 @@ from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from realtime_agentic_site_builder.agents.identity import IDENTITIES
+from realtime_agentic_site_builder.canvas.mirror import corrections
 from realtime_agentic_site_builder.canvas.projection import (
     SMOOTHING_DELAY_MS,
     DeadReckoner,
@@ -156,8 +157,14 @@ class CanvasDelta(DomainModel):
     frame_seq: int
     delta_seq: int
     agent_id: str
+    # The element and the author's color, so a viewer can light up what changed and who did it.
+    target_id: str
+    color: str
     target_domain: Literal["frontend", "backend"]
     patches: tuple[PatchOperation, ...] = ()
+    # Applied after ``patches``, these make the viewer's copy equal to what committed. They are
+    # left out when the viewer's copy is not the one the delta applied to, which it detects.
+    corrections: tuple[PatchOperation, ...] = ()
 
 
 class CanvasOverride(DomainModel):
@@ -244,14 +251,26 @@ def thought_entry(event: ThoughtEvent) -> ThoughtEntry:
     )
 
 
-def canvas_delta(event: StateEvent) -> CanvasDelta:
+Layout = dict[str, Any]
+
+
+def canvas_delta(event: StateEvent, mirror: tuple[Layout, Layout] | None = None) -> CanvasDelta:
+    """Describe a commit for a viewer's mirror.
+
+    ``mirror`` is the layout the viewer held before the commit and the one it produced, both as
+    JSON, when the caller knows the viewer held exactly the layout the commit was applied to.
+    """
     delta = event.delta
+    patches = delta.patches if delta.target_domain == "frontend" else ()
     return CanvasDelta(
         frame_seq=event.snapshot.frame_seq,
         delta_seq=delta.delta_seq,
         agent_id=delta.agent_id,
+        target_id=delta.target_id,
+        color=participant(delta.agent_id).color,
         target_domain=delta.target_domain,
-        patches=delta.patches if delta.target_domain == "frontend" else (),
+        patches=patches,
+        corrections=() if mirror is None else corrections(mirror[0], patches, mirror[1]),
     )
 
 
