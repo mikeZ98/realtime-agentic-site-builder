@@ -236,6 +236,8 @@ class ClientConnection:
             await self._publish_presence()
             # Cursors arrive many times a second, so they are only answered if asked.
             return None if request_id is None else ack.model_dump_json()
+        # Anyone with a token can watch and be seen. Changing anything is the owner's alone.
+        self._service.require_owner(self.session_id, self.identity)
         if isinstance(message, LockAcquireMessage):
             lock = await self._hub.lock_manager(self.session_id).acquire(
                 message.target_id, self.identity.agent_id, HUMAN_LOCK_PRIORITY, self._hub.now_ms()

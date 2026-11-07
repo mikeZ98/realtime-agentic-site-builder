@@ -187,10 +187,14 @@ class GatewayService:
             raise SessionNotFoundError(session_id=session_id)
         return runtime
 
+    def require_owner(self, session_id: str, identity: Identity) -> None:
+        if self._runtime(session_id).owner != identity.user_id:
+            raise PermissionDeniedError(
+                "Only the session's creator can do this. Others can watch and show presence."
+            )
+
     async def close_session(self, identity: Identity, session_id: str) -> None:
-        runtime = self._runtime(session_id)
-        if runtime.owner != identity.user_id:
-            raise PermissionDeniedError("Only the session's creator can close it.")
+        self.require_owner(session_id, identity)
         await self._retire(session_id)
         await self.hub.close_session(session_id)
 

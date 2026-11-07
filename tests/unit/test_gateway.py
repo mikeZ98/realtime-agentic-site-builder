@@ -1412,7 +1412,7 @@ async def test_delta_without_a_lock_is_rejected_with_a_conflict() -> None:
 
 async def test_locked_delta_commits_under_the_verified_identity() -> None:
     async with running() as harness:
-        session_id = await harness.create_session()
+        session_id = await harness.create_session(user_id=BOB)
         socket = harness.socket(session_id, user_id=BOB)
         await socket.connect()
         socket.send({"type": "lock.acquire", "target_id": "frontend:document", "request_id": "l"})
@@ -1435,38 +1435,94 @@ async def test_locked_delta_commits_under_the_verified_identity() -> None:
 async def test_lock_held_by_someone_else_queues_the_request() -> None:
     async with running() as harness:
         session_id = await harness.create_session()
-        alice = harness.socket(session_id, user_id=ALICE)
-        bob = harness.socket(session_id, user_id=BOB)
-        await alice.connect()
-        await bob.connect()
-        alice.send({"type": "lock.acquire", "target_id": "frontend:document"})
-        await alice.receive_kind("ack")
-        bob.send({"type": "lock.acquire", "target_id": "frontend:document"})
-        assert (await bob.receive_kind("ack"))["lock"]["state"] == LockState.WAITING.value
-        bob.send(set_title("Too soon"))
-        assert (await bob.receive_kind("error"))["problem"]["status"] == 409
-        await alice.disconnect()
-        await bob.disconnect()
+        hub = harness.service.hub
+        await hub.lock_manager(session_id).acquire(
+            "frontend:document", "agent-architect", 100, hub.now_ms()
+        )
+        socket = harness.socket(session_id)
+        await socket.connect()
+        socket.send({"type": "lock.acquire", "target_id": "frontend:document"})
+        assert (await socket.receive_kind("ack"))["lock"]["state"] == LockState.WAITING.value
+        socket.send(set_title("Too soon"))
+        assert (await socket.receive_kind("error"))["problem"]["status"] == 409
+        await socket.disconnect()
 
 
 async def test_lock_release_frees_it_for_the_next_in_line() -> None:
     async with running() as harness:
         session_id = await harness.create_session()
-        alice = harness.socket(session_id, user_id=ALICE)
-        bob = harness.socket(session_id, user_id=BOB)
-        await alice.connect()
-        await bob.connect()
-        alice.send({"type": "lock.acquire", "target_id": "hero"})
-        await alice.receive_kind("ack")
-        bob.send({"type": "lock.acquire", "target_id": "hero"})
-        await bob.receive_kind("ack")
-        alice.send({"type": "lock.release", "target_id": "hero", "request_id": "rel"})
-        assert (await alice.receive_kind("ack"))["request_id"] == "rel"
-        notice = await bob.receive_kind("lock")
-        assert notice["event"]["kind"] == "PROMOTED"
-        assert notice["event"]["lock"]["locked_by_agent_id"] == "user:bob"
-        await alice.disconnect()
-        await bob.disconnect()
+        hub = harness.service.hub
+        socket = harness.socket(session_id)
+        await socket.connect()
+        socket.send({"type": "lock.acquire", "target_id": "hero"})
+        await socket.receive_kind("ack")
+        await hub.lock_manager(session_id).acquire("hero", "agent-coder", 50, hub.now_ms())
+        socket.send({"type": "lock.release", "target_id": "hero", "request_id": "rel"})
+        assert (await socket.receive_kind("ack"))["request_id"] == "rel"
+        while (notice := await socket.receive_kind("lock"))["event"]["kind"] != "PROMOTED":
+            pass
+        assert notice["event"]["lock"]["locked_by_agent_id"] == "agent-coder"
+        await socket.disconnect()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "prompt", "text": "Spend the owner's budget"},
+        {"type": "lock.acquire", "target_id": "hero"},
+        {"type": "lock.release", "target_id": "hero"},
+        {
+            "type": "delta",
+            "target_domain": "frontend",
+            "target_id": "frontend:document",
+            "patches": [{"op": "replace", "path": "/frontend/title", "value": "Hijacked"}],
+        },
+    ],
+    ids=["prompt", "lock.acquire", "lock.release", "delta"],
+)
+async def test_a_viewer_is_refused_anything_that_changes_the_session(
+    message: dict[str, Any],
+) -> None:
+    provider = MockLLMProvider()
+    async with running(provider=provider) as harness:
+        session_id = await harness.create_session()
+        viewer = harness.socket(session_id, user_id=BOB)
+        await viewer.connect()
+        viewer.send({**message, "request_id": "viewer"})
+        frame = await viewer.receive_kind("error")
+        assert frame["request_id"] == "viewer"
+        assert frame["problem"]["status"] == 403
+        assert frame["problem"]["type"].endswith("/permission-denied")
+        assert harness.service._sessions[session_id].run is None
+        assert provider.calls == []
+        hub = harness.service.hub
+        assert hub.latest_snapshot(session_id).frame_seq == 0
+        assert hub.lock_manager(session_id).active_locks() == ()
+        await viewer.disconnect()
+
+
+async def test_a_viewer_can_read_and_show_presence_while_the_owner_runs_the_swarm() -> None:
+    async with running() as harness:
+        session_id = await harness.create_session()
+        owner = harness.socket(session_id, user_id=ALICE)
+        viewer = harness.socket(session_id, user_id=BOB)
+        await owner.connect()
+        await viewer.connect()
+
+        viewer.send({"type": "cursor", "x": 5, "y": 6, "request_id": "c"})
+        assert (await viewer.receive_kind("ack"))["request_id"] == "c"
+        viewer.send({"type": "select", "target_id": "hero", "request_id": "s"})
+        assert (await viewer.receive_kind("ack"))["request_id"] == "s"
+        while (frame := await owner.receive_kind("presence"))["user_id"] != BOB or (
+            frame["selected_id"] != "hero"
+        ):
+            pass
+
+        owner.send({"type": "prompt", "text": "Build it", "request_id": "run"})
+        assert (await owner.receive_kind("ack"))["request_id"] == "run"
+        await drain_thoughts_until(viewer, "run.completed")
+        await owner.disconnect()
+        await viewer.disconnect()
 
 
 async def test_locks_are_released_when_the_last_connection_of_a_user_leaves() -> None:
