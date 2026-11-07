@@ -100,6 +100,7 @@ _SCRIPT: Final = r"""
   const BUFFER_MS = @@CLIENT_BUFFER_MS@@, COAST_MS = @@EXTRAPOLATION_LIMIT_MS@@;
   const RESET_MS = @@MOTION_RESET_MS@@, HEARTBEAT_MS = @@HEARTBEAT_MS@@;
   const PRESENCE_MS = @@PRESENCE_INTERVAL_MS@@, CONVERGE_MS = @@CONVERGENCE_MS@@, TRAIL_MS = 700;
+  const FEED_LIMIT = 200;
   const TOKEN_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
   const SESSION_ENDED = 1000, GOING_AWAY = 1001, POLICY = 1008, NOT_FOUND = 4404;
   const $ = (id) => document.getElementById(id);
@@ -141,7 +142,9 @@ _SCRIPT: Final = r"""
     opened = false;
     status("idle", attempts ? "Reconnecting" : "Connecting");
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${scheme}//${location.host}${base}/ws/sessions/${sessionId}?view=canvas`;
+    // A reconnect asks for exactly what it missed, so the feed has no holes or repeats.
+    const resume = lastFeedSeq >= 0 ? `&last_seen_thought_seq=${lastFeedSeq}` : "";
+    const url = `${scheme}//${location.host}${base}/ws/sessions/${sessionId}?view=canvas${resume}`;
     socket = new WebSocket(url, ["@@SUBPROTOCOL@@", `@@TOKEN_PREFIX@@${token}`]);
     socket.onopen = () => {
       opened = true;
@@ -182,6 +185,9 @@ _SCRIPT: Final = r"""
       me = message;
       $("gate").hidden = true;
       status("live", message.is_owner ? "Live, owner" : "Live, viewing");
+      if (message.thought_gap) note("Some thoughts were missed while disconnected.");
+    } else if (message.kind === "canvas.thought") {
+      addThought(message);
     } else if (message.kind === "canvas") {
       takeFrame(message);
     }
@@ -221,28 +227,37 @@ _SCRIPT: Final = r"""
 
   function takeScene(next) {
     scene = next;
+    clampScroll();
+  }
+
+  function appendToFeed(item) {
     const feed = $("feed");
     const pinned = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
-    for (const entry of next.thoughts) {
-      if (entry.seq <= lastFeedSeq) continue;
-      lastFeedSeq = entry.seq;
-      const item = document.createElement("li");
-      item.style.setProperty("--who", entry.color);
-      const who = document.createElement("b");
-      who.textContent = entry.label;
-      item.append(who, entry.text);
-      if (entry.tool_name) {
-        const tool = document.createElement("code");
-        tool.textContent = ` ${entry.tool_name}`;
-        item.append(tool);
-      }
-      feed.append(item);
-    }
-    while (feed.children.length > next.thoughts.length && feed.children.length > 50) {
-      feed.firstElementChild.remove();
-    }
+    feed.append(item);
+    while (feed.children.length > FEED_LIMIT) feed.firstElementChild.remove();
     if (pinned) feed.scrollTop = feed.scrollHeight;
-    clampScroll();
+  }
+
+  function note(text) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    appendToFeed(item);
+  }
+
+  function addThought(entry) {
+    if (entry.seq <= lastFeedSeq) return;
+    lastFeedSeq = entry.seq;
+    const item = document.createElement("li");
+    item.style.setProperty("--who", entry.color);
+    const who = document.createElement("b");
+    who.textContent = entry.label;
+    item.append(who, entry.text);
+    if (entry.tool_name) {
+      const tool = document.createElement("code");
+      tool.textContent = ` ${entry.tool_name}`;
+      item.append(tool);
+    }
+    appendToFeed(item);
   }
 
   function coasted(knot, t) {

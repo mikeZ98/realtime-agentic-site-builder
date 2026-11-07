@@ -31,6 +31,7 @@ from realtime_agentic_site_builder.canvas.compositor import (
     VisualFrame,
     human_color,
     participant,
+    thought_entry,
 )
 from realtime_agentic_site_builder.canvas.projection import (
     BADGE_GAP_PX,
@@ -898,45 +899,35 @@ def test_a_docked_badge_sits_at_the_dock_and_an_undocked_one_at_the_cursor() -> 
     assert badge.side is None
 
 
-def test_a_thought_with_no_cursor_goes_to_history_without_a_badge_and_is_still_cleaned_up() -> None:
+def test_a_thought_with_no_cursor_gets_no_badge_and_is_still_cleaned_up() -> None:
     compositor = CanvasCompositor(page())
     compositor.apply(thought(), 1000.0)
-    frame = composed(compositor, 1001.0)
-    assert frame.badges == ()
-    assert [entry.text for entry in frame.scene.thoughts] == ["Thinking"]
+    assert composed(compositor, 1001.0).badges == ()
     composed(compositor, 1000.0 + BADGE_ENTER_MS + BADGE_HOLD_MS + BADGE_EXIT_MS)
     assert compositor._badges == {}
 
 
-def test_history_is_bounded_and_keeps_the_newest() -> None:
-    compositor = CanvasCompositor(page())
-    for seq in range(MAX_THOUGHT_HISTORY + 20):
-        compositor.apply(thought(seq), float(seq))
-    entries = composed(compositor).scene.thoughts
-    assert len(entries) == MAX_THOUGHT_HISTORY
-    assert entries[0].seq == 20
-    assert entries[-1].seq == MAX_THOUGHT_HISTORY + 19
-    assert entries[-1].label == "Frontend Coder"
-    assert entries[-1].tool_name == "llm.generate"
+def test_a_thought_becomes_a_feed_entry_that_names_its_author() -> None:
+    entry = thought_entry(thought(7, AgentRole.ARCHITECT, "Planning"))
+    assert entry.model_dump() == {
+        "kind": "canvas.thought",
+        "seq": 7,
+        "agent_id": "agent-architect",
+        "label": "Architect",
+        "color": "#8B5CF6",
+        "text": "Planning",
+        "tool_name": "llm.generate",
+    }
 
 
 def test_long_thoughts_become_bounded_snippets() -> None:
     compositor = with_cursor()
     compositor.apply(thought(text="x" * 4000), 1000.0)
-    frame = composed(compositor, 1001.0)
-    assert len(frame.badges[0].text) == MAX_SNIPPET_LENGTH
-    assert frame.badges[0].text.endswith("…")
-    assert frame.scene.thoughts[0].text == frame.badges[0].text
-    compositor.apply(thought(1, text="y" * MAX_SNIPPET_LENGTH), 1001.0)
-    assert composed(compositor, 1002.0).scene.thoughts[-1].text == "y" * MAX_SNIPPET_LENGTH
-
-
-def test_thoughts_from_before_joining_are_history_only() -> None:
-    compositor = with_cursor()
-    compositor.add_history([thought(0), thought(1)])
-    frame = composed(compositor, 1.0)
-    assert [entry.seq for entry in frame.scene.thoughts] == [0, 1]
-    assert frame.badges == ()
+    badge = composed(compositor, 1001.0).badges[0]
+    assert len(badge.text) == MAX_SNIPPET_LENGTH
+    assert badge.text.endswith("…")
+    assert thought_entry(thought(text="x" * 4000)).text == badge.text
+    assert thought_entry(thought(text="y" * MAX_SNIPPET_LENGTH)).text == "y" * MAX_SNIPPET_LENGTH
 
 
 # --- compositor: events ---------------------------------------------------------------------
@@ -1311,6 +1302,7 @@ async def test_canvas_view_opens_with_a_hello_and_the_full_scene() -> None:
             "user_id": ALICE,
             "agent_id": "user:alice",
             "is_owner": True,
+            "latest_thought_seq": None,
             "replayed_thoughts": 0,
             "thought_gap": False,
         }
@@ -1509,33 +1501,60 @@ async def test_disconnecting_releases_a_persons_locks_and_the_overlay_clears() -
         await watcher.disconnect()
 
 
-async def test_thoughts_reach_the_scene_with_earlier_ones_as_history() -> None:
+async def think(harness: Harness, session_id: str, text: str) -> None:
+    await harness.service.hub.broadcast_thought(
+        session_id,
+        AgentThoughtStream(
+            agent_id="agent-coder", role=AgentRole.FRONTEND_CODER, thought=text, timestamp_ms=1
+        ),
+    )
+
+
+async def test_a_new_viewer_gets_recent_history_then_every_thought_live() -> None:
     async with running() as harness:
         session_id = await harness.staged()
-        hub = harness.service.hub
-
-        async def think(text: str) -> None:
-            await hub.broadcast_thought(
-                session_id,
-                AgentThoughtStream(
-                    agent_id="agent-coder",
-                    role=AgentRole.FRONTEND_CODER,
-                    thought=text,
-                    timestamp_ms=1,
-                ),
-            )
-
-        await think("Before joining")
+        for index in range(MAX_THOUGHT_HISTORY + 5):
+            await think(harness, session_id, f"Before {index}")
         socket = harness.socket(session_id)
         hello = await socket.connect()
-        assert hello["replayed_thoughts"] == 1
-        first = await socket.scene_where(lambda _scene: True)
-        assert [entry["text"] for entry in first["thoughts"]] == ["Before joining"]
+        assert hello["replayed_thoughts"] == MAX_THOUGHT_HISTORY
+        assert hello["latest_thought_seq"] == MAX_THOUGHT_HISTORY + 4
+        assert hello["thought_gap"] is False, "history is not a gap, only a missed resume is"
+        replayed = [await socket.receive() for _ in range(MAX_THOUGHT_HISTORY)]
+        assert [entry["kind"] for entry in replayed] == ["canvas.thought"] * MAX_THOUGHT_HISTORY
+        assert [entry["seq"] for entry in replayed] == list(range(5, MAX_THOUGHT_HISTORY + 5))
 
-        await think("After joining")
-        scene = await socket.scene_where(lambda s: len(s["thoughts"]) == 2)
-        assert scene["thoughts"][1]["text"] == "After joining"
+        await think(harness, session_id, "After joining")
+        live = await socket.reply("canvas.thought")
+        assert (live["seq"], live["text"]) == (MAX_THOUGHT_HISTORY + 5, "After joining")
         await socket.frame_where(lambda item: item["badges"])
+        await socket.disconnect()
+
+
+async def test_a_reconnecting_viewer_gets_exactly_what_it_missed() -> None:
+    async with running() as harness:
+        session_id = await harness.staged()
+        for index in range(3):
+            await think(harness, session_id, f"Seen {index}")
+        for index in range(120):
+            await think(harness, session_id, f"Missed {index}")
+        socket = harness.socket(session_id, query="view=canvas&last_seen_thought_seq=2")
+        hello = await socket.connect()
+        assert (hello["replayed_thoughts"], hello["thought_gap"]) == (120, False)
+        seqs = [(await socket.receive())["seq"] for _ in range(120)]
+        assert seqs == list(range(3, 123))
+        await socket.disconnect()
+
+
+async def test_resuming_from_beyond_the_backlog_is_reported_as_a_gap() -> None:
+    async with running(make_settings(thought_backlog_size=10)) as harness:
+        session_id = await harness.staged()
+        for index in range(30):
+            await think(harness, session_id, f"Thought {index}")
+        socket = harness.socket(session_id, query="view=canvas&last_seen_thought_seq=0")
+        hello = await socket.connect()
+        assert (hello["replayed_thoughts"], hello["thought_gap"]) == (10, True)
+        assert [(await socket.receive())["seq"] for _ in range(10)] == list(range(20, 30))
         await socket.disconnect()
 
 
@@ -1553,8 +1572,7 @@ async def test_thought_text_stays_sanitized_on_the_way_to_the_page() -> None:
         )
         socket = harness.socket(session_id)
         await socket.connect()
-        scene = await socket.scene_where(lambda _scene: True)
-        assert scene["thoughts"][0]["text"] == "Harmless"
+        assert (await socket.receive())["text"] == "Harmless"
         await socket.disconnect()
 
 
@@ -1567,44 +1585,37 @@ async def test_a_swarm_run_is_visible_in_the_canvas_view() -> None:
         await socket.scene_where(
             lambda scene: {"hero", "contact"} <= {item["id"] for item in scene["overlays"]}
         )
-        await socket.scene_where(lambda scene: len(scene["thoughts"]) > 3)
+        tools = set()
+        while "run.completed" not in tools:
+            tools.add((await socket.reply("canvas.thought"))["tool_name"])
+        assert {"graph.enter", "llm.generate", "hub.apply_delta"} <= tools
         await socket.disconnect()
 
 
-async def test_a_slow_client_gets_fewer_frames_and_nothing_queues_behind_it() -> None:
+async def test_a_slow_client_gets_fewer_frames_but_every_thought_in_order() -> None:
     release = asyncio.Event()
-    sent = 0
+    sent: list[dict[str, Any]] = []
 
-    async def gate(_message: Message) -> None:
-        nonlocal sent
-        sent += 1
-        if sent >= 3:
+    async def gate(message: Message) -> None:
+        sent.append(json.loads(message["text"]))
+        if len(sent) >= 3:
             await release.wait()
 
-    settings = make_settings(ws_catchup_deadline_ms=60_000)
-    async with running(settings) as harness:
+    async with running(make_settings(ws_catchup_deadline_ms=60_000)) as harness:
         session_id = await harness.staged()
-        hub = harness.service.hub
         socket = harness.socket(session_id, send_gate=gate)
         await socket.connect()
-        await asyncio.wait_for(_until(lambda: sent >= 3), WAIT_S)
+        await asyncio.wait_for(_until(lambda: len(sent) >= 3), WAIT_S)
         for index in range(200):
-            await hub.broadcast_thought(
-                session_id,
-                AgentThoughtStream(
-                    agent_id="agent-coder",
-                    role=AgentRole.FRONTEND_CODER,
-                    thought=f"Thought {index}",
-                    timestamp_ms=1,
-                ),
-            )
+            await think(harness, session_id, f"Thought {index}")
         await asyncio.sleep(0.05)
         release.set()
-        scene = await socket.scene_where(
-            lambda s: s["thoughts"] and s["thoughts"][-1]["text"] == "Thought 199"
-        )
-        assert len(scene["thoughts"]) == MAX_THOUGHT_HISTORY
-        assert sent < 200, "the backlog folded into a frame, rather than each being sent"
+        while not any(item.get("seq") == 199 for item in sent):
+            await socket.receive()
+        thoughts = [item["seq"] for item in sent if item["kind"] == "canvas.thought"]
+        assert thoughts == list(range(200))
+        frames = [item for item in sent if item["kind"] == "canvas"]
+        assert len(frames) < 10, "the stall folded motion into a few frames, not 50 ms of them"
         await socket.disconnect()
 
 

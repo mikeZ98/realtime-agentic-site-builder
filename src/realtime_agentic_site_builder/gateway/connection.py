@@ -10,8 +10,12 @@ from typing import TYPE_CHECKING, Final, cast
 from pydantic import JsonValue, ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from realtime_agentic_site_builder.canvas.compositor import CanvasCompositor, CanvasScene
-from realtime_agentic_site_builder.core.hub import SessionListener, SwarmSessionHub
+from realtime_agentic_site_builder.canvas.compositor import (
+    CanvasCompositor,
+    CanvasScene,
+    thought_entry,
+)
+from realtime_agentic_site_builder.core.hub import SessionListener, SwarmSessionHub, ThoughtEvent
 from realtime_agentic_site_builder.domain.errors import SessionNotFoundError, SiteBuilderError
 from realtime_agentic_site_builder.domain.swarm import StreamDelta
 from realtime_agentic_site_builder.gateway.auth import Identity
@@ -299,8 +303,10 @@ class ClientConnection:
 class CanvasConnection(ClientConnection):
     """Sends composited frames at a fixed rate instead of forwarding each event.
 
-    Everything buffered is folded into the compositor before each frame, so nothing queues behind a
-    slow client. It simply receives fewer frames, each as current as any other.
+    Everything buffered is folded into the compositor before each frame, so motion never queues
+    behind a slow client: it simply receives fewer frames, each as current as any other. Thoughts
+    are the exception. Each also goes out as its own frame, in order, because a feed must not skip
+    any, and the catch-up deadline is what bounds a client that cannot keep up with them.
     """
 
     def __init__(
@@ -319,17 +325,27 @@ class CanvasConnection(ClientConnection):
         self._interval_s = 1 / self._hub.settings.broadcast_fps
 
     async def _stream(self) -> CloseReason:
+        loop = asyncio.get_running_loop()
+        next_frame_at = loop.time()
         while True:
             if self._replies:
                 await self._send(self._replies.popleft())
                 continue
             now_ms = self._service.clock()
+            thoughts: list[str] = []
             while (event := self._listener.poll()) is not None:
                 self._compositor.apply(event, now_ms)
+                if isinstance(event, ThoughtEvent):
+                    thoughts.append(thought_entry(event).model_dump_json())
             if self._listener.closed:
                 return self._end_reason
+            for thought in thoughts:
+                await self._send(thought)
             await self._send(self._next_frame(now_ms))
-            await asyncio.sleep(self._interval_s)
+            # Paced from a schedule rather than from each send, which would add its own time to
+            # every interval. After falling behind, it resumes the schedule from now.
+            next_frame_at = max(next_frame_at + self._interval_s, loop.time())
+            await asyncio.sleep(next_frame_at - loop.time())
 
     def _next_frame(self, now_ms: int) -> str:
         locks = self._hub.lock_manager(self.session_id).active_locks()

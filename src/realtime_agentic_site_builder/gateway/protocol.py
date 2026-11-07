@@ -99,6 +99,7 @@ class CanvasHello(DomainModel):
     user_id: Identifier
     agent_id: Identifier
     is_owner: bool
+    latest_thought_seq: int | None
     replayed_thoughts: int
     thought_gap: bool
 

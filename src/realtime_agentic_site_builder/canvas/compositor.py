@@ -57,6 +57,7 @@ DOCKING_ACTIONS: Final = frozenset(
         AgentAction.PATCHING_AST,
     }
 )
+# What a fresh viewer is shown of the past. One that reconnects asks for what it missed instead.
 MAX_THOUGHT_HISTORY: Final = 50
 MAX_SNIPPET_LENGTH: Final = 200
 BADGE_ENTER_MS: Final = 200
@@ -130,6 +131,9 @@ class ThoughtBadge(DomainModel):
 
 
 class ThoughtEntry(DomainModel):
+    """One thought for a viewer's feed. Each is sent once, in order, and never conflated."""
+
+    kind: Literal["canvas.thought"] = "canvas.thought"
     seq: int
     agent_id: str
     label: str
@@ -157,7 +161,6 @@ class CanvasScene(DomainModel):
 
     viewport: ViewportSize
     overlays: tuple[LockOverlay, ...]
-    thoughts: tuple[ThoughtEntry, ...]
 
 
 class VisualFrame(DomainModel):
@@ -192,6 +195,19 @@ def _snippet(text: str) -> str:
     if len(text) <= MAX_SNIPPET_LENGTH:
         return text
     return f"{text[: MAX_SNIPPET_LENGTH - 1].rstrip()}…"
+
+
+def thought_entry(event: ThoughtEvent) -> ThoughtEntry:
+    thought = event.thought
+    who = participant(thought.agent_id)
+    return ThoughtEntry(
+        seq=event.seq,
+        agent_id=who.id,
+        label=who.label,
+        color=who.color,
+        text=_snippet(thought.thought),
+        tool_name=thought.tool_name,
+    )
 
 
 @dataclass(slots=True)
@@ -238,7 +254,6 @@ class CanvasCompositor:
         self._agents: dict[str, _AgentTrack] = {}
         self._humans: dict[str, _HumanTrack] = {}
         self._badges: dict[str, deque[_Badge]] = {}
-        self._thoughts: deque[ThoughtEntry] = deque(maxlen=MAX_THOUGHT_HISTORY)
         self._adopt(bundle)
 
     @property
@@ -285,30 +300,13 @@ class CanvasCompositor:
         track.selected_id = selected_id
         track.motion.observe(now_ms, position)
 
-    def add_history(self, events: Iterable[ThoughtEvent]) -> None:
-        """Take in thoughts from before this viewer joined. They are history, so get no badge."""
-        self._thoughts.extend(self._entry(event) for event in events)
-
     def add_thought(self, event: ThoughtEvent, now_ms: float) -> None:
-        entry = self._entry(event)
-        self._thoughts.append(entry)
+        """Badge a new thought. The thought itself reaches the feed as its own frame."""
+        entry = thought_entry(event)
         badges = self._badges.setdefault(entry.agent_id, deque(maxlen=_BADGES_PER_AGENT))
         for badge in badges:
             badge.fade_from_ms = min(badge.fade_from_ms, now_ms)
         badges.append(_Badge(entry.text, now_ms, now_ms + BADGE_ENTER_MS + BADGE_HOLD_MS))
-
-    @staticmethod
-    def _entry(event: ThoughtEvent) -> ThoughtEntry:
-        thought = event.thought
-        who = participant(thought.agent_id)
-        return ThoughtEntry(
-            seq=event.seq,
-            agent_id=who.id,
-            label=who.label,
-            color=who.color,
-            text=_snippet(thought.thought),
-            tool_name=thought.tool_name,
-        )
 
     def compose(
         self, now_ms: float, locks: Iterable[ElementLock], lock_time_ms: int
@@ -332,9 +330,7 @@ class CanvasCompositor:
             agents=agents,
             humans=humans,
             badges=self._badge_views(now_ms, agents),
-            scene=CanvasScene(
-                viewport=size, overlays=self._overlays(live), thoughts=tuple(self._thoughts)
-            ),
+            scene=CanvasScene(viewport=size, overlays=self._overlays(live)),
         )
 
     def _agent_sprite(

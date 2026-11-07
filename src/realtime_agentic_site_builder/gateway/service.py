@@ -20,7 +20,11 @@ from realtime_agentic_site_builder.agents.graph import create_swarm_graph
 from realtime_agentic_site_builder.agents.identity import IDENTITIES
 from realtime_agentic_site_builder.agents.provider import LLMProvider, TieredLLMProvider
 from realtime_agentic_site_builder.agents.state import initial_state
-from realtime_agentic_site_builder.canvas.compositor import CanvasCompositor
+from realtime_agentic_site_builder.canvas.compositor import (
+    MAX_THOUGHT_HISTORY,
+    CanvasCompositor,
+    thought_entry,
+)
 from realtime_agentic_site_builder.canvas.viewer import viewer_response
 from realtime_agentic_site_builder.config import Settings, get_settings
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
@@ -28,6 +32,7 @@ from realtime_agentic_site_builder.core.hub import (
     EventBus,
     SessionListener,
     SwarmSessionHub,
+    ThoughtBacklog,
     ThoughtEvent,
 )
 from realtime_agentic_site_builder.domain.backend import (
@@ -272,13 +277,20 @@ class GatewayService:
         session_id: str,
         runtime: _SessionRuntime,
         listener: SessionListener,
+        snapshot: SwarmSnapshot,
+        backlog: ThoughtBacklog,
+        last_seen: int | None,
     ) -> CanvasConnection:
-        """Build a canvas client from a settled picture of the session. This never suspends."""
-        snapshot = self.hub.latest_snapshot(session_id)
-        backlog = self.hub.thought_backlog(session_id)
+        """Build a canvas client from a settled picture of the session. This never suspends.
+
+        A reconnecting viewer gets everything after what it last saw. A new one gets recent history.
+        """
+        if last_seen is None:
+            replay, gap = backlog.events[-MAX_THOUGHT_HISTORY:], False
+        else:
+            replay, gap = backlog.events, backlog.gap
         now_ms = self.clock()
         compositor = CanvasCompositor(snapshot.bundle_state)
-        compositor.add_history(backlog.events)
         for other in self._connections:
             presence = other.presence() if other.session_id == session_id else None
             if presence is not None:
@@ -288,11 +300,21 @@ class GatewayService:
             user_id=identity.user_id,
             agent_id=identity.agent_id,
             is_owner=runtime.owner == identity.user_id,
-            replayed_thoughts=len(backlog.events),
-            thought_gap=backlog.gap,
+            latest_thought_seq=backlog.latest_seq,
+            replayed_thoughts=len(replay),
+            thought_gap=gap,
         )
         return CanvasConnection(
-            self, websocket, identity, session_id, listener, (hello.model_dump_json(),), compositor
+            self,
+            websocket,
+            identity,
+            session_id,
+            listener,
+            (
+                hello.model_dump_json(),
+                *(thought_entry(event).model_dump_json() for event in replay),
+            ),
+            compositor,
         )
 
     async def serve(
@@ -321,7 +343,9 @@ class GatewayService:
         gap = backlog.gap if last_seen is not None else False
         connection: ClientConnection
         if view == "canvas":
-            connection = self._canvas_connection(websocket, identity, session_id, runtime, listener)
+            connection = self._canvas_connection(
+                websocket, identity, session_id, runtime, listener, snapshot, backlog, last_seen
+            )
         else:
             sync = SyncFrame(
                 session_id=session_id,
