@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Final, cast
 from pydantic import JsonValue, ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from realtime_agentic_site_builder.canvas.compositor import CanvasCompositor, CanvasScene
 from realtime_agentic_site_builder.core.hub import SessionListener, SwarmSessionHub
 from realtime_agentic_site_builder.domain.errors import SessionNotFoundError, SiteBuilderError
 from realtime_agentic_site_builder.domain.swarm import StreamDelta
@@ -88,6 +89,7 @@ class ClientConnection:
         self._x = 0
         self._y = 0
         self._selected: str | None = None
+        self.has_presence = False
         settings = self._hub.settings
         self._deadline_s = settings.ws_catchup_deadline_ms / 1000
         self._tokens = float(settings.ws_max_messages_per_second)
@@ -131,22 +133,25 @@ class ClientConnection:
         try:
             for frame in self._initial_frames:
                 await self._send(frame, catching_up=True)
-            while True:
-                if self._replies:
-                    await self._send(self._replies.popleft())
-                elif (event := self._listener.poll()) is not None:
-                    await self._send(event.model_dump_json())
-                elif self._listener.closed:
-                    return self._end_reason
-                else:
-                    await self._listener.wait()
-                    # Stamped on waking: time spent with nothing to send is not time spent behind.
-                    self._caught_up_at = asyncio.get_running_loop().time()
+            return await self._stream()
         except TimeoutError:
             logger.warning("evicting slow consumer %s", self.identity.user_id)
             return SLOW_CONSUMER
         except (WebSocketDisconnect, RuntimeError):
             return None
+
+    async def _stream(self) -> CloseReason:
+        while True:
+            if self._replies:
+                await self._send(self._replies.popleft())
+            elif (event := self._listener.poll()) is not None:
+                await self._send(event.model_dump_json())
+            elif self._listener.closed:
+                return self._end_reason
+            else:
+                await self._listener.wait()
+                # Stamped on waking: time spent with nothing to send is not time spent behind.
+                self._caught_up_at = asyncio.get_running_loop().time()
 
     async def _send(self, frame: str, *, catching_up: bool = False) -> None:
         now = asyncio.get_running_loop().time()
@@ -267,7 +272,14 @@ class ClientConnection:
         )
         return (await self._hub.apply_delta(self.session_id, delta)).frame_seq
 
+    def presence(self) -> tuple[str, int, int, str | None] | None:
+        """Report where this client is, for those joining later, once it has said anything."""
+        if not self.has_presence:
+            return None
+        return self.identity.user_id, self._x, self._y, self._selected
+
     async def _publish_presence(self, *, active: bool = True) -> None:
+        self.has_presence = active
         await self._hub.broadcast_presence(
             self.session_id,
             self.identity.user_id,
@@ -282,6 +294,50 @@ class ClientConnection:
             await self._publish_presence(active=False)
         except SessionNotFoundError:
             logger.debug("session %s ended before its client left", self.session_id)
+
+
+class CanvasConnection(ClientConnection):
+    """Sends composited frames at a fixed rate instead of forwarding each event.
+
+    Everything buffered is folded into the compositor before each frame, so nothing queues behind a
+    slow client. It simply receives fewer frames, each as current as any other.
+    """
+
+    def __init__(
+        self,
+        service: "GatewayService",
+        websocket: WebSocket,
+        identity: Identity,
+        session_id: str,
+        listener: SessionListener,
+        initial_frames: tuple[str, ...],
+        compositor: CanvasCompositor,
+    ) -> None:
+        super().__init__(service, websocket, identity, session_id, listener, initial_frames)
+        self._compositor = compositor
+        self._scene: CanvasScene | None = None
+        self._interval_s = 1 / self._hub.settings.broadcast_fps
+
+    async def _stream(self) -> CloseReason:
+        while True:
+            if self._replies:
+                await self._send(self._replies.popleft())
+                continue
+            now_ms = self._service.clock()
+            while (event := self._listener.poll()) is not None:
+                self._compositor.apply(event, now_ms)
+            if self._listener.closed:
+                return self._end_reason
+            await self._send(self._next_frame(now_ms))
+            await asyncio.sleep(self._interval_s)
+
+    def _next_frame(self, now_ms: int) -> str:
+        locks = self._hub.lock_manager(self.session_id).active_locks()
+        frame = self._compositor.compose(now_ms, locks, self._hub.now_ms())
+        if frame.scene == self._scene:
+            return frame.model_dump_json(exclude={"scene"})
+        self._scene = frame.scene
+        return frame.model_dump_json()
 
 
 def _invalid(request_id: str | None, detail: str) -> str:

@@ -8,11 +8,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Annotated, Any, Final, cast
+from typing import Annotated, Any, Final, Literal, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -20,9 +20,16 @@ from realtime_agentic_site_builder.agents.graph import create_swarm_graph
 from realtime_agentic_site_builder.agents.identity import IDENTITIES
 from realtime_agentic_site_builder.agents.provider import LLMProvider, TieredLLMProvider
 from realtime_agentic_site_builder.agents.state import initial_state
+from realtime_agentic_site_builder.canvas.compositor import CanvasCompositor
+from realtime_agentic_site_builder.canvas.viewer import viewer_response
 from realtime_agentic_site_builder.config import Settings, get_settings
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
-from realtime_agentic_site_builder.core.hub import EventBus, SwarmSessionHub, ThoughtEvent
+from realtime_agentic_site_builder.core.hub import (
+    EventBus,
+    SessionListener,
+    SwarmSessionHub,
+    ThoughtEvent,
+)
 from realtime_agentic_site_builder.domain.backend import (
     BackendBlueprint,
     DatabaseDialect,
@@ -57,9 +64,10 @@ from realtime_agentic_site_builder.gateway.auth import (
 from realtime_agentic_site_builder.gateway.connection import (
     WS_POLICY_VIOLATION,
     WS_SESSION_NOT_FOUND,
+    CanvasConnection,
     ClientConnection,
 )
-from realtime_agentic_site_builder.gateway.protocol import PromptText, SyncFrame
+from realtime_agentic_site_builder.gateway.protocol import CanvasHello, PromptText, SyncFrame
 from realtime_agentic_site_builder.simulation.controller import CursorSimulator
 from realtime_agentic_site_builder.simulation.ticker import SimulationTicker, monotonic_ms
 from realtime_agentic_site_builder.synthesis.exporter import ArchiveFormat, export_bundle
@@ -67,6 +75,7 @@ from realtime_agentic_site_builder.synthesis.exporter import ArchiveFormat, expo
 logger = logging.getLogger(__name__)
 
 JSON_MEDIA_TYPE: Final = "application/json"
+SessionView = Literal["canvas"]
 
 
 class CreateSessionRequest(DomainModel):
@@ -256,8 +265,43 @@ class GatewayService:
     def forget_lock(self, session_id: str, identity: Identity, target_id: str) -> None:
         self._runtime(session_id).locks.get(identity.user_id, set()).discard(target_id)
 
+    def _canvas_connection(
+        self,
+        websocket: WebSocket,
+        identity: Identity,
+        session_id: str,
+        runtime: _SessionRuntime,
+        listener: SessionListener,
+    ) -> CanvasConnection:
+        """Build a canvas client from a settled picture of the session. This never suspends."""
+        snapshot = self.hub.latest_snapshot(session_id)
+        backlog = self.hub.thought_backlog(session_id)
+        now_ms = self.clock()
+        compositor = CanvasCompositor(snapshot.bundle_state)
+        compositor.add_history(backlog.events)
+        for other in self._connections:
+            presence = other.presence() if other.session_id == session_id else None
+            if presence is not None:
+                compositor.place_human(*presence, now_ms)
+        hello = CanvasHello(
+            session_id=session_id,
+            user_id=identity.user_id,
+            agent_id=identity.agent_id,
+            is_owner=runtime.owner == identity.user_id,
+            replayed_thoughts=len(backlog.events),
+            thought_gap=backlog.gap,
+        )
+        return CanvasConnection(
+            self, websocket, identity, session_id, listener, (hello.model_dump_json(),), compositor
+        )
+
     async def serve(
-        self, websocket: WebSocket, identity: Identity, session_id: str, last_seen: int | None
+        self,
+        websocket: WebSocket,
+        identity: Identity,
+        session_id: str,
+        last_seen: int | None,
+        view: SessionView | None = None,
     ) -> None:
         """Serve one client. Everything up to the first await below it happens atomically.
 
@@ -275,24 +319,30 @@ class GatewayService:
             return
         replay = backlog.events if last_seen is not None else ()
         gap = backlog.gap if last_seen is not None else False
-        sync = SyncFrame(
-            session_id=session_id,
-            user_id=identity.user_id,
-            agent_id=identity.agent_id,
-            snapshot=snapshot,
-            latest_thought_seq=backlog.latest_seq,
-            replayed_thoughts=len(replay),
-            thought_gap=gap,
-        )
-        frames = (sync.model_dump_json(), *(event.model_dump_json() for event in replay))
-        connection = ClientConnection(self, websocket, identity, session_id, listener, frames)
+        connection: ClientConnection
+        if view == "canvas":
+            connection = self._canvas_connection(websocket, identity, session_id, runtime, listener)
+        else:
+            sync = SyncFrame(
+                session_id=session_id,
+                user_id=identity.user_id,
+                agent_id=identity.agent_id,
+                snapshot=snapshot,
+                latest_thought_seq=backlog.latest_seq,
+                replayed_thoughts=len(replay),
+                thought_gap=gap,
+            )
+            frames = (sync.model_dump_json(), *(event.model_dump_json() for event in replay))
+            connection = ClientConnection(self, websocket, identity, session_id, listener, frames)
         self._connections.add(connection)
         runtime.connections[identity.user_id] = runtime.connections.get(identity.user_id, 0) + 1
         try:
             await connection.run()
         finally:
             self._connections.discard(connection)
-            await connection.announce_departure()
+            # Someone with a second tab open has not left.
+            if runtime.connections[identity.user_id] == 1:
+                await connection.announce_departure()
             await self._release_on_last_departure(session_id, runtime, identity)
 
     async def _release_on_last_departure(
@@ -511,11 +561,22 @@ async def delete_session(session_id: str, service: Service, identity: CurrentUse
     return Response(status_code=204)
 
 
+@router.get("/canvas/{session_id}", response_class=HTMLResponse, include_in_schema=False)
+async def canvas_viewer() -> Response:
+    """Serve the viewer, which authenticates itself on the socket. A page load cannot send a header.
+
+    The page is the same static bytes for every session and caller, and it reflects nothing from
+    the request, so serving it reveals nothing, including whether the session exists.
+    """
+    return viewer_response()
+
+
 @router.websocket("/ws/sessions/{session_id}")
 async def session_socket(
     websocket: WebSocket,
     session_id: str,
     last_seen_thought_seq: Annotated[int | None, Query(ge=0)] = None,
+    view: SessionView | None = None,
 ) -> None:
     service: GatewayService = websocket.app.state.gateway
     subprotocols = websocket.scope.get("subprotocols", [])
@@ -531,7 +592,7 @@ async def session_socket(
         await websocket.close(WS_POLICY_VIOLATION, "Authentication required")
         return
     await websocket.accept(subprotocol=SUBPROTOCOL if SUBPROTOCOL in subprotocols else None)
-    await service.serve(websocket, identity, session_id, last_seen_thought_seq)
+    await service.serve(websocket, identity, session_id, last_seen_thought_seq, view)
 
 
 def create_app(

@@ -91,6 +91,18 @@ class SyncFrame(DomainModel):
     thought_gap: bool
 
 
+class CanvasHello(DomainModel):
+    """The first frame of a canvas view, which then only receives composited visual frames."""
+
+    kind: Literal["canvas.hello"] = "canvas.hello"
+    session_id: Identifier
+    user_id: Identifier
+    agent_id: Identifier
+    is_owner: bool
+    replayed_thoughts: int
+    thought_gap: bool
+
+
 class PongFrame(DomainModel):
     kind: Literal["pong"] = "pong"
     request_id: RequestId | None = None
