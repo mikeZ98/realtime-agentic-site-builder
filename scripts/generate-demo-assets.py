@@ -15,12 +15,13 @@ import itertools
 import math
 import random
 from collections import deque
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
+from pydantic import SecretStr
 
 from realtime_agentic_site_builder.agents.identity import IDENTITIES
 from realtime_agentic_site_builder.canvas.compositor import (
@@ -31,14 +32,34 @@ from realtime_agentic_site_builder.canvas.compositor import (
     VisualFrame,
     human_color,
 )
+from realtime_agentic_site_builder.canvas.mirror import corrections
 from realtime_agentic_site_builder.canvas.projection import DeadReckoner, hermite_controls
-from realtime_agentic_site_builder.canvas.viewer import CLIENT_BUFFER_MS
-from realtime_agentic_site_builder.core.hub import ThoughtEvent
+from realtime_agentic_site_builder.canvas.viewer import (
+    CLIENT_BUFFER_MS,
+    GLOW_DECAY_MS,
+    GRAPH_NODES,
+    HISTORY_CHECKPOINT_EVERY,
+    RADAR_PULSE_MS,
+    SPRING_DAMPING,
+    SPRING_STIFFNESS,
+)
+from realtime_agentic_site_builder.config import Settings
+from realtime_agentic_site_builder.core.hub import SwarmSessionHub, ThoughtEvent
 from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager, LockEvent
+from realtime_agentic_site_builder.core.patch_engine import (
+    PatchEngine,
+    bundle_size,
+    replay_operations,
+)
 from realtime_agentic_site_builder.domain.backend import (
+    EMAIL_COMPATIBLE_TYPE,
+    ApiEndpointNode,
     BackendBlueprint,
     DatabaseDialect,
+    DataModelSchema,
+    FieldDefinition,
     FullstackProjectBundle,
+    HttpMethod,
 )
 from realtime_agentic_site_builder.domain.blueprint import (
     BoundingBox,
@@ -46,7 +67,12 @@ from realtime_agentic_site_builder.domain.blueprint import (
     ComponentType,
     SiteBlueprint,
 )
-from realtime_agentic_site_builder.domain.swarm import AgentRole, AgentThoughtStream
+from realtime_agentic_site_builder.domain.swarm import (
+    AgentRole,
+    AgentThoughtStream,
+    PatchOperation,
+    StreamDelta,
+)
 from realtime_agentic_site_builder.simulation.controller import CursorSimulator
 from realtime_agentic_site_builder.simulation.motion import Point, Viewport, cubic_bezier
 
@@ -56,6 +82,7 @@ GIF_PATH: Final = ASSETS / "swarm-live-demo.gif"
 SVG_PATH: Final = ASSETS / "architecture-topology.svg"
 CONVERGENCE_PATH: Final = ASSETS / "dead-reckoning-convergence.svg"
 LOCKS_PATH: Final = ASSETS / "lock-contention-matrix.svg"
+FORKING_PATH: Final = ASSETS / "time-travel-forking.svg"
 
 WORLD: Final = Viewport(1920, 1080)
 OUT_W, OUT_H = 800, 450
@@ -68,6 +95,7 @@ PALETTE_SIZE: Final = 96
 TRANSPARENT_INDEX: Final = PALETTE_SIZE - 1
 MAX_GIF_BYTES: Final = 2 * 1024 * 1024
 HUMAN: Final = "alice"
+PULSE_MS: Final = RADAR_PULSE_MS
 
 BG: Final = (11, 15, 25)
 PANEL: Final = (17, 24, 39)
@@ -81,18 +109,58 @@ ARCHITECT, CODER, BACKEND = (
     AgentRole.BACKEND_ENGINEER,
 )
 STYLER, CRITIC, COPYWRITER = AgentRole.STYLER, AgentRole.CRITIC_LINTER, AgentRole.COPYWRITER
+# The graph node each role runs, which is what the HUD's radar shows. The Copywriter has none.
+NODES: Final = {
+    ARCHITECT: GRAPH_NODES[0],
+    CODER: GRAPH_NODES[1],
+    BACKEND: GRAPH_NODES[2],
+    STYLER: GRAPH_NODES[3],
+    CRITIC: GRAPH_NODES[4],
+}
 
 
 def _component(
-    component_id: str, title: str, x: int, y: int, width: int, height: int
+    component_id: str,
+    kind: ComponentType,
+    title: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    endpoint: str | None = None,
 ) -> ComponentNode:
     return ComponentNode.create(
         id=component_id,
-        component_type=ComponentType.FEATURES,
+        component_type=kind,
         title=title,
         code="export default function Section() { return <section />; }",
         box=BoundingBox(x=x, y=y, width=width, height=height),
+        connected_endpoint_id=endpoint,
     )
+
+
+# What the Backend Engineer is writing in the script: the endpoint the contact form posts to.
+LEADS: Final = BackendBlueprint(
+    service_name="api",
+    database_dialect=DatabaseDialect.SQLITE,
+    models=(
+        DataModelSchema(
+            name="Lead",
+            table_name="leads",
+            fields={"email": FieldDefinition(python_type=EMAIL_COMPATIBLE_TYPE)},
+        ),
+    ),
+    endpoints=(
+        ApiEndpointNode(
+            id="api_endpoint_post_leads",
+            path="/api/v1/leads",
+            method=HttpMethod.POST,
+            summary="Create a lead",
+            request_model_ref="Lead",
+            handler_code="async def handler() -> dict[str, str]:\n    return {'status': 'ok'}",
+        ),
+    ),
+)
 
 
 BUNDLE: Final = FullstackProjectBundle(
@@ -102,22 +170,36 @@ BUNDLE: Final = FullstackProjectBundle(
         title="SaaS landing page",
         theme="dark",
         components=(
-            _component("navbar", "Navbar", 60, 40, 1800, 90),
-            _component("hero", "Hero", 60, 160, 1800, 300),
-            _component("features", "Features", 60, 490, 880, 260),
-            _component("pricing", "Pricing", 980, 490, 880, 260),
-            _component("contact", "Contact form", 60, 780, 1100, 250),
-            _component("footer", "Footer", 1200, 780, 660, 250),
+            _component("navbar", ComponentType.NAVBAR, "Acme", 60, 40, 1800, 90),
+            _component("hero", ComponentType.HERO, "Hero", 60, 160, 1800, 300),
+            _component("features", ComponentType.FEATURES, "Features", 60, 490, 880, 260),
+            _component("pricing", ComponentType.PRICING, "Pricing", 980, 490, 880, 260),
+            _component(
+                "contact",
+                ComponentType.CONTACT_FORM,
+                "Contact form",
+                60,
+                780,
+                1100,
+                250,
+                "api_endpoint_post_leads",
+            ),
+            _component("footer", ComponentType.FOOTER, "Footer", 1200, 780, 660, 250),
         ),
     ),
-    backend=BackendBlueprint(service_name="api", database_dialect=DatabaseDialect.SQLITE),
+    backend=LEADS,
 )
 BOXES: Final = {component.id: component.box for component in BUNDLE.frontend.components}
 
 
 @dataclass(frozen=True, slots=True)
 class Cue:
-    """One scripted moment: a lock change, a cursor intent, and what the agent says about it."""
+    """One scripted moment: a lock change, a cursor intent, and what the agent says about it.
+
+    ``title`` commits a new title for the target through the real patch engine, which the DOM
+    mirror then applies from the patches and corrections a viewer would be sent. ``verdict`` is
+    the critic's, which the HUD's radar pulses on.
+    """
 
     at_ms: int
     role: AgentRole
@@ -125,6 +207,8 @@ class Cue:
     target: str | None = None
     lock: str | None = None  # "take", "want" or "drop"
     thought: str | None = None
+    title: str | None = None
+    verdict: bool | None = None
 
 
 SCRIPT: Final = (
@@ -136,13 +220,18 @@ SCRIPT: Final = (
     Cue(1200, ARCHITECT, "go", "pricing"),
     Cue(1350, COPYWRITER, "wait", "features", "want", "Waiting for Styler on features"),
     Cue(1700, CRITIC, "wait", "hero", "want", "Queued to review the hero"),
+    Cue(2100, CODER, "edit", "hero", None, "Committing the hero", title="Ship faster with Acme"),
     Cue(2300, CODER, "go", "pricing", "drop", "Hero committed, releasing the lock"),
     Cue(2300, CRITIC, "edit", "hero", None, "Reviewing hero contrast"),
     Cue(2700, STYLER, "go", "footer", "drop"),
     Cue(2700, COPYWRITER, "edit", "features", None, "Rewriting feature copy"),
+    Cue(2900, BACKEND, "edit", "contact", None, "Wiring the form", title="Talk to sales"),
     Cue(3000, ARCHITECT, "edit", "pricing", "take", "Adjusting the pricing tiers"),
+    Cue(3150, CRITIC, "edit", "hero", None, "Feature copy runs long", verdict=False),
     Cue(3400, BACKEND, "go", "footer", "drop", "Endpoint and schema committed"),
-    Cue(3900, CRITIC, "go", "contact", "drop", "Hero approved"),
+    Cue(3450, COPYWRITER, "edit", "features", None, "Tightened", title="Everything you need"),
+    Cue(3600, ARCHITECT, "edit", "pricing", None, "Three tiers", title="Simple, fair pricing"),
+    Cue(3900, CRITIC, "go", "contact", "drop", "Approved", verdict=True),
     Cue(4300, ARCHITECT, "idle", None, "drop", "Run complete, all checks passed"),
     Cue(4300, COPYWRITER, "idle", None, "drop"),
     Cue(4300, CODER, "idle"),
@@ -157,68 +246,252 @@ def human_path(t_ms: float) -> Point:
     return Point(1500 + 260 * math.sin(t_ms / 900), 620 + 140 * math.sin(t_ms / 620 + 0.8))
 
 
-async def simulate() -> list[VisualFrame]:
-    """Run the script through the real simulator, lock manager and compositor."""
+@dataclass(slots=True)
+class Spring:
+    """One mirrored section's motion and halo, integrated exactly as the viewer page does."""
+
+    s: float = 1.0
+    v: float = 0.0
+    x: float = 0.0
+    y: float = 0.0
+    vx: float = 0.0
+    vy: float = 0.0
+    glow: float = 0.0
+    halo: str = "#334155"
+
+    def kick(self, color: str, strength: float, vx: float, vy: float) -> None:
+        self.glow, self.halo = max(self.glow, strength), color
+        speed = math.hypot(vx, vy)
+        self.v += strength * (0.35 + min(speed / 800, 0.65))
+        if speed > 1:
+            push = strength * 110 * min(speed, 1200) / 1200
+            self.vx += vx / speed * push
+            self.vy += vy / speed * push
+
+    def step(self, dt: float) -> None:
+        self.v += (-SPRING_STIFFNESS * (self.s - 1) - SPRING_DAMPING * self.v) * dt
+        self.s += self.v * dt
+        self.vx += (-SPRING_STIFFNESS * self.x - SPRING_DAMPING * self.vx) * dt
+        self.x += self.vx * dt
+        self.vy += (-SPRING_STIFFNESS * self.y - SPRING_DAMPING * self.vy) * dt
+        self.y += self.vy * dt
+        self.glow *= math.exp(-dt * 1000 / GLOW_DECAY_MS)
+
+
+@dataclass(frozen=True, slots=True)
+class Section:
+    """What the mirror draws of one component in one frame."""
+
+    id: str
+    kind: str
+    title: str
+    box: BoundingBox
+    scale: float
+    dx: float
+    dy: float
+    glow: float
+    halo: str
+
+
+@dataclass(frozen=True, slots=True)
+class Hud:
+    visits: dict[str, int]
+    active: frozenset[str]
+    pulses: tuple[tuple[float, bool], ...]
+    rejected: int
+    approved: int
+    frame_seq: int
+    commits: int
+    held: int
+
+
+@dataclass(frozen=True, slots=True)
+class Shot:
+    frame: VisualFrame
+    sections: tuple[Section, ...]
+    hud: Hud
+
+
+@dataclass
+class Session:
+    """The scripted session: the real simulator, lock manager, compositor and patch engine."""
+
+    simulator: CursorSimulator
+    locks: AsyncLockManager
+    compositor: CanvasCompositor
+    bundle: FullstackProjectBundle = BUNDLE
+    mirror: dict[str, object] = field(
+        default_factory=lambda: {"frontend": BUNDLE.frontend.model_dump(mode="json")}
+    )
+    springs: dict[str, Spring] = field(default_factory=dict)
+    visits: dict[str, int] = field(default_factory=dict)
+    active: set[str] = field(default_factory=set)
+    pulses: list[tuple[float, bool]] = field(default_factory=list)
+    rejected: int = 0
+    approved: int = 0
+    frame_seq: int = 0
+    thought_seq: int = 0
+    owners: dict[str, str | None] = field(default_factory=dict)
+    last: VisualFrame | None = None
+
+    def velocity(self, agent_id: str) -> tuple[float, float]:
+        sprites = self.last.agents if self.last else ()
+        sprite = next((sprite for sprite in sprites if sprite.id == agent_id), None)
+        return (sprite.vx, sprite.vy) if sprite else (0.0, 0.0)
+
+    def kick(self, target: str, agent_id: str, color: str, strength: float) -> None:
+        self.springs.setdefault(target, Spring()).kick(color, strength, *self.velocity(agent_id))
+
+    def commit(self, cue: Cue, now: int) -> None:
+        """Commit a title through the engine, and mirror it the way a viewer's page does."""
+        assert cue.target is not None and cue.title is not None
+        identity = IDENTITIES[cue.role]
+        index = [item.id for item in self.bundle.frontend.components].index(cue.target)
+        patches = (
+            PatchOperation.model_validate(
+                {"op": "replace", "path": f"/frontend/components/{index}/title", "value": cue.title}
+            ),
+        )
+        delta = StreamDelta(
+            session_id="demo",
+            agent_id=identity.agent_id,
+            delta_seq=self.frame_seq,
+            target_domain="frontend",
+            target_id=cue.target,
+            patches=patches,
+            emitted_at_ms=now,
+        )
+        before = self.bundle.frontend.model_dump(mode="json")
+        self.bundle, _ = PatchEngine().apply_patch(self.bundle, delta)
+        after = self.bundle.frontend.model_dump(mode="json")
+        replay_operations(self.mirror, (*patches, *corrections(before, patches, after)))
+        if self.mirror["frontend"] != after:
+            raise SystemExit("the mirror diverged from the committed layout")
+        self.frame_seq += 1
+        self.kick(cue.target, identity.agent_id, identity.color, 1.0)
+
+    def tally(self, cue: Cue, now: int) -> None:
+        node = NODES.get(cue.role)
+        if node is not None and cue.move == "edit" and node not in self.active:
+            self.active.add(node)
+            self.visits[node] = self.visits.get(node, 0) + 1
+        elif node is not None and (cue.lock == "drop" or cue.move == "idle"):
+            self.active.discard(node)
+        if cue.verdict is not None:
+            self.pulses.append((float(now), cue.verdict))
+            self.rejected += not cue.verdict
+            self.approved += cue.verdict
+
+    async def perform(self, cue: Cue, now: int) -> None:
+        identity = IDENTITIES[cue.role]
+        box = BOXES[cue.target] if cue.target else None
+        held = [
+            lock.target_id
+            for lock in self.locks.active_locks()
+            if lock.locked_by_agent_id == identity.agent_id
+        ]
+        if cue.title is not None:
+            self.commit(cue, now)
+        if cue.lock == "drop":
+            for target in held:
+                await self.locks.release(target, identity.agent_id)
+        elif cue.lock in {"take", "want"} and cue.target:
+            await self.locks.acquire(cue.target, identity.agent_id, identity.priority, now)
+        if cue.move == "edit" and box is not None:
+            self.simulator.edit(cue.role, box)
+        elif cue.move == "go" and box is not None:
+            self.simulator.navigate_to(cue.role, box)
+        elif cue.move == "wait" and box is not None:
+            self.simulator.block_on(cue.role, box)
+        else:
+            self.simulator.idle(cue.role)
+        self.tally(cue, now)
+        if cue.thought is None:
+            return
+        thought = AgentThoughtStream(
+            agent_id=identity.agent_id, role=cue.role, thought=cue.thought, timestamp_ms=now
+        )
+        self.compositor.add_thought(
+            ThoughtEvent(origin="demo", session_id="demo", seq=self.thought_seq, thought=thought),
+            now,
+        )
+        self.thought_seq += 1
+
+    def shoot(self, frame: VisualFrame, t_ms: float) -> Shot:
+        """Settle the springs for this frame, as the page's animation loop does, and record it."""
+        self.last = frame
+        for overlay in frame.scene.overlays:
+            owner = overlay.owner
+            if owner is not None and self.owners.get(overlay.id) != owner.id:
+                self.kick(overlay.id, owner.id, owner.color, 0.8)
+            self.owners[overlay.id] = owner.id if owner else None
+        sections = []
+        overlays = {overlay.id: overlay for overlay in frame.scene.overlays}
+        components = self.mirror["frontend"]["components"]  # type: ignore[index]
+        for item in components:
+            spring = self.springs.setdefault(item["id"], Spring())
+            spring.step(1 / FPS)
+            held = overlays.get(item["id"])
+            rest, rest_color = 0.0, spring.halo
+            if held is not None and held.state.value != "FREE":
+                lead = held.owner or held.waiters[0]
+                rest, rest_color = 0.35, lead.color
+                if held.state.value == "WAITING":
+                    rest = 0.22 + 0.16 * math.sin(t_ms / 180)
+            flashing = spring.glow > rest
+            sections.append(
+                Section(
+                    id=item["id"],
+                    kind=item["component_type"],
+                    title=item["title"],
+                    box=BoundingBox.model_validate(item["box"]),
+                    scale=spring.s,
+                    dx=spring.x,
+                    dy=spring.y,
+                    glow=max(spring.glow, rest),
+                    halo=spring.halo if flashing else rest_color,
+                )
+            )
+        self.pulses = [pulse for pulse in self.pulses if t_ms - pulse[0] < PULSE_MS]
+        hud = Hud(
+            visits=dict(self.visits),
+            active=frozenset(self.active),
+            pulses=tuple(self.pulses),
+            rejected=self.rejected,
+            approved=self.approved,
+            frame_seq=self.frame_seq,
+            commits=self.frame_seq,
+            held=sum(lock.state.value == "ACQUIRED" for lock in self.locks.active_locks()),
+        )
+        return Shot(frame, tuple(sections), hud)
+
+
+async def simulate() -> list[Shot]:
+    """Run the script through the real simulator, lock manager, compositor and patch engine."""
     now = 0
-    simulator = CursorSimulator(WORLD, seed=11)
-    locks = AsyncLockManager(lease_ms=30_000, clock=lambda: now)
-    compositor = CanvasCompositor(BUNDLE)
+    session = Session(
+        CursorSimulator(WORLD, seed=11),
+        AsyncLockManager(lease_ms=30_000, clock=lambda: now),
+        CanvasCompositor(BUNDLE),
+    )
     pending = deque(sorted(SCRIPT, key=lambda cue: cue.at_ms))
-    thought_seq = 0
-    frames: list[VisualFrame] = []
+    shots: list[Shot] = []
     elapsed = 0
     for index in range(FRAMES):
         target_ms = round((index + 1) * 1000 / FPS)
         while pending and pending[0].at_ms <= target_ms:
-            cue = pending.popleft()
-            thought_seq = await _perform(cue, simulator, locks, compositor, thought_seq, now)
-        simulator.sync(BUNDLE, locks.active_locks())
-        for frame in simulator.step(target_ms - elapsed):
-            compositor.place_agent(frame, float(target_ms))
+            await session.perform(pending.popleft(), now)
+        session.simulator.sync(BUNDLE, session.locks.active_locks())
+        for frame in session.simulator.step(target_ms - elapsed):
+            session.compositor.place_agent(frame, float(target_ms))
         elapsed = now = target_ms
         position = human_path(target_ms)
-        compositor.place_human(HUMAN, round(position.x), round(position.y), "pricing", target_ms)
-        frames.append(compositor.compose(float(target_ms), locks.active_locks(), now))
-    return frames
-
-
-async def _perform(
-    cue: Cue,
-    simulator: CursorSimulator,
-    locks: AsyncLockManager,
-    compositor: CanvasCompositor,
-    thought_seq: int,
-    now: int,
-) -> int:
-    identity = IDENTITIES[cue.role]
-    box = BOXES[cue.target] if cue.target else None
-    held = [
-        lock.target_id
-        for lock in locks.active_locks()
-        if lock.locked_by_agent_id == identity.agent_id
-    ]
-    if cue.lock == "drop":
-        for target in held:
-            await locks.release(target, identity.agent_id)
-    elif cue.lock in {"take", "want"} and cue.target:
-        await locks.acquire(cue.target, identity.agent_id, identity.priority, now)
-    if cue.move == "edit" and box is not None:
-        simulator.edit(cue.role, box)
-    elif cue.move == "go" and box is not None:
-        simulator.navigate_to(cue.role, box)
-    elif cue.move == "wait" and box is not None:
-        simulator.block_on(cue.role, box)
-    else:
-        simulator.idle(cue.role)
-    if cue.thought is None:
-        return thought_seq
-    thought = AgentThoughtStream(
-        agent_id=identity.agent_id, role=cue.role, thought=cue.thought, timestamp_ms=now
-    )
-    compositor.add_thought(
-        ThoughtEvent(origin="demo", session_id="demo", seq=thought_seq, thought=thought), now
-    )
-    return thought_seq + 1
+        session.compositor.place_human(
+            HUMAN, round(position.x), round(position.y), "pricing", target_ms
+        )
+        composed = session.compositor.compose(float(target_ms), session.locks.active_locks(), now)
+        shots.append(session.shoot(composed, float(target_ms)))
+    return shots
 
 
 # --- drawing --------------------------------------------------------------------------------
@@ -236,12 +509,16 @@ def _sx(x: float) -> float:
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.load_default(size=size * SUPERSAMPLE)
+    font = ImageFont.load_default(size=size * SUPERSAMPLE)
+    if not isinstance(font, ImageFont.FreeTypeFont):
+        raise SystemExit("Pillow was built without FreeType, which the assets need")
+    return font
 
 
 FONT_SMALL: Final = _font(9)
 FONT_LABEL: Final = _font(10)
 FONT_TITLE: Final = _font(11)
+FONT_HERO: Final = _font(17)
 
 
 def _pill(
@@ -262,47 +539,191 @@ def _pill(
 
 
 def _draw_overlay(draw: ImageDraw.ImageDraw, overlay: LockOverlay, t_ms: float) -> None:
+    """Who holds what, outlined over the mirror, which draws the section itself."""
     box = overlay.box
     left, top = _sx(box.x * WORLD.width), _sx(box.y * WORLD.height)
     right, bottom = left + _sx(box.width * WORLD.width), top + _sx(box.height * WORLD.height)
-    leader = overlay.owner or (overlay.waiters[0] if overlay.waiters else None)
-    color = _hex(leader.color) if leader else LINE
-    draw.rounded_rectangle((left, top, right, bottom), radius=6 * SUPERSAMPLE, fill=PANEL)
     if overlay.state.value == "FREE":
         draw.rounded_rectangle(
-            (left, top, right, bottom), radius=6 * SUPERSAMPLE, outline=LINE, width=SUPERSAMPLE
-        )
-    else:
-        pulse = 0.55 + 0.45 * math.sin(t_ms / 160) if overlay.state.value == "WAITING" else 1.0
-        for spread, alpha in ((6, 0.12), (3, 0.25)):
-            grow = spread * SUPERSAMPLE
-            draw.rounded_rectangle(
-                (left - grow, top - grow, right + grow, bottom + grow),
-                radius=(6 + spread) * SUPERSAMPLE,
-                outline=(*color, round(255 * alpha * pulse)),
-                width=2 * SUPERSAMPLE,
-            )
-        draw.rounded_rectangle(
             (left, top, right, bottom),
-            radius=6 * SUPERSAMPLE,
-            outline=(*color, round(255 * pulse)),
-            width=2 * SUPERSAMPLE,
+            radius=7 * SUPERSAMPLE,
+            outline=(*LINE, 110),
+            width=SUPERSAMPLE,
         )
-    draw.text(
-        (left + 8 * SUPERSAMPLE, top + 6 * SUPERSAMPLE), overlay.title, font=FONT_TITLE, fill=MUTED
+        return
+    leader = overlay.owner or overlay.waiters[0]
+    color = _hex(leader.color)
+    pulse = 0.55 + 0.45 * math.sin(t_ms / 180) if overlay.state.value == "WAITING" else 1.0
+    draw.rounded_rectangle(
+        (left, top, right, bottom),
+        radius=7 * SUPERSAMPLE,
+        outline=(*color, round(255 * pulse)),
+        width=2 * SUPERSAMPLE,
     )
-    if overlay.state.value != "FREE":
-        queue = f" +{len(overlay.waiters)} waiting" if overlay.waiters else ""
-        label = (
-            f"{overlay.owner.label}{queue}" if overlay.owner else f"{len(overlay.waiters)} waiting"
+    queue = f" +{len(overlay.waiters)} waiting" if overlay.waiters else ""
+    label = f"{overlay.owner.label}{queue}" if overlay.owner else f"{len(overlay.waiters)} waiting"
+    _pill(draw, label, left + 8 * SUPERSAMPLE, bottom - 22 * SUPERSAMPLE, color)
+
+
+# The page's dark theme, which the mirror draws each section in.
+PAGE_BG: Final = _hex("#0F172A")
+CARD: Final = _hex("#1E293B")
+DIM: Final = _hex("#334155")
+ACCENT: Final = _hex("#6366F1")
+INK_PAGE: Final = _hex("#E2E8F0")
+
+
+def _draw_section(draw: ImageDraw.ImageDraw, section: Section) -> None:
+    """One mirrored section: its real title over the page's skeleton for its kind, never its code.
+
+    Geometry passes through the section's spring: scaled about its center and nudged along the
+    path of the cursor that last kicked it.
+    """
+    box = section.box
+    cx, cy = box.x + box.width / 2 + section.dx, box.y + box.height / 2 + section.dy
+
+    def at(x: float, y: float) -> tuple[float, float]:
+        return _sx(cx + (x - box.x - box.width / 2) * section.scale), _sx(
+            cy + (y - box.y - box.height / 2) * section.scale
         )
-        _pill(
-            draw,
-            label,
-            left + 8 * SUPERSAMPLE,
-            bottom - 22 * SUPERSAMPLE,
-            color,
+
+    def rect(x: float, y: float, w: float, h: float, **style: object) -> None:
+        (x0, y0), (x1, y1) = at(x, y), at(x + w, y + h)
+        draw.rounded_rectangle((x0, y0, x1, y1), **style)  # type: ignore[arg-type]
+
+    left, top, width, height = box.x, box.y, box.width, box.height
+    if section.glow > 0.02:
+        halo = _hex(section.halo)
+        for spread, alpha in ((22, 0.10), (12, 0.22), (5, 0.4)):
+            grow = spread * section.glow
+            rect(
+                left - grow,
+                top - grow,
+                width + 2 * grow,
+                height + 2 * grow,
+                radius=(16 + grow) * SCALE,
+                outline=(*halo, round(255 * alpha * section.glow)),
+                width=round(3 * SUPERSAMPLE),
+            )
+    rect(left, top, width, height, radius=16 * SCALE, fill=CARD)
+    pad = 26
+    tx, ty = at(left + pad, top + pad)
+    font = FONT_HERO if section.kind == "HERO" else FONT_TITLE
+    draw.text((tx, ty), section.title, font=font, fill=INK_PAGE)
+    inner_top = top + pad + (88 if section.kind == "HERO" else 54)
+    inner_w = width - 2 * pad
+
+    def bars(x: float, y: float, w: float, count: int) -> None:
+        for index in range(count):
+            rect(x, y + index * 26, w * (1, 0.74, 0.52)[index % 3], 12, radius=6 * SCALE, fill=DIM)
+
+    def button(x: float, y: float) -> None:
+        rect(x, y, 150, 40, radius=9 * SCALE, fill=ACCENT)
+
+    def cards(count: int, fill: Callable[[float, float, float], None]) -> None:
+        gap = 20
+        card_w = (inner_w - gap * (count - 1)) / count
+        for index in range(count):
+            x = left + pad + index * (card_w + gap)
+            rect(x, inner_top, card_w, top + height - pad - inner_top, radius=10 * SCALE, fill=DIM)
+            fill(x + 16, inner_top + 18, card_w - 32)
+
+    if section.kind == "NAVBAR":
+        for index in range(3):
+            rect(left + width - 560 + index * 120, top + 40, 90, 12, radius=6 * SCALE, fill=DIM)
+        button(left + width - 190, top + 25)
+    elif section.kind == "HERO":
+        bars(left + pad, inner_top, inner_w * 0.6, 2)
+        button(left + pad, inner_top + 70)
+    elif section.kind == "FEATURES":
+        cards(3, lambda x, y, w: bars(x, y, w, 3))
+    elif section.kind == "PRICING":
+
+        def tier(x: float, y: float, w: float) -> None:
+            rect(x, y, w * 0.5, 26, radius=6 * SCALE, fill=INK_PAGE)
+            bars(x, y + 44, w, 2)
+
+        cards(3, tier)
+    elif section.kind == "CONTACT_FORM":
+        for index in range(3):
+            rect(
+                left + pad,
+                inner_top + index * 46,
+                inner_w * 0.7,
+                34,
+                radius=7 * SCALE,
+                outline=DIM,
+                width=SUPERSAMPLE,
+            )
+    else:
+        for index in range(4):
+            rect(left + pad + index * 150, inner_top + 20, 110, 12, radius=6 * SCALE, fill=DIM)
+
+
+HUD_W, HUD_H = 168, 206
+
+
+def _draw_hud(draw: ImageDraw.ImageDraw, hud: Hud, t_ms: float) -> None:
+    """The heads-up display, with what a simulation can derive: no spend, no latency."""
+    s = SUPERSAMPLE
+    # Top right, over the hero's empty side, so the titles the mirror updates stay in view.
+    x0, y0 = (OUT_W - 8 - HUD_W) * s, 8 * s
+    draw.rounded_rectangle(
+        (x0, y0, x0 + HUD_W * s, y0 + HUD_H * s),
+        radius=9 * s,
+        fill=(*BG, 235),
+        outline=(*LINE, 255),
+        width=s,
+    )
+    draw.text((x0 + 10 * s, y0 + 10 * s), "GRAPH STATE", font=FONT_SMALL, fill=MUTED)
+    cx, cy, radius = x0 + HUD_W * s / 2, y0 + 78 * s, 40 * s
+    count = len(GRAPH_NODES)
+
+    def corner(index: int, r: float) -> tuple[float, float]:
+        angle = -math.pi / 2 + index * 2 * math.pi / count
+        return cx + math.cos(angle) * r, cy + math.sin(angle) * r
+
+    for ring in (1 / 3, 2 / 3, 1):
+        draw.polygon([corner(i, radius * ring) for i in range(count)], outline=(*LINE, 255))
+    for i in range(count):
+        draw.line((cx, cy, *corner(i, radius)), fill=(*LINE, 255), width=1)
+    for at, ok in hud.pulses:
+        age = (t_ms - at) / PULSE_MS
+        color = (16, 185, 129) if ok else (248, 113, 113)
+        r = radius * (0.15 + age)
+        draw.ellipse(
+            (cx - r, cy - r, cx + r, cy + r),
+            outline=(*color, round(255 * (1 - age))),
+            width=round((2 if ok else 2 + 3 * (1 - age)) * s),
         )
+    most = max(1, *hud.visits.values()) if hud.visits else 1
+    shape = [
+        corner(i, radius * max(hud.visits.get(node, 0) / most, 0.06))
+        for i, node in enumerate(GRAPH_NODES)
+    ]
+    draw.polygon(shape, fill=(139, 92, 246, 60), outline=(139, 92, 246, 255), width=s)
+    for i, node in enumerate(GRAPH_NODES):
+        if node in hud.active:
+            px, py = corner(i, radius)
+            glow = 0.6 + 0.4 * math.sin(t_ms / 140)
+            dot = 4 * s
+            draw.ellipse(
+                (px - dot, py - dot, px + dot, py + dot), fill=(196, 181, 253, round(255 * glow))
+            )
+        lx, ly = corner(i, radius + 13 * s)
+        draw.text(
+            (lx, ly), node, font=FONT_SMALL, fill=TEXT if node in hud.active else MUTED, anchor="mm"
+        )
+    rows = (
+        ("Critic", f"{hud.rejected} rejected, {hud.approved} approved"),
+        ("Mirror frame", str(hud.frame_seq)),
+        ("Commits", str(hud.commits)),
+        ("Locks held", str(hud.held)),
+    )
+    for index, (name, value) in enumerate(rows):
+        y = y0 + (140 + index * 15) * s
+        draw.text((x0 + 10 * s, y), name, font=FONT_SMALL, fill=MUTED)
+        draw.text((x0 + (HUD_W - 10) * s, y), value, font=FONT_SMALL, fill=TEXT, anchor="ra")
 
 
 def _draw_trail(
@@ -380,7 +801,7 @@ def _draw_badge(draw: ImageDraw.ImageDraw, badge: ThoughtBadge) -> None:
 
 
 def _draw_legend(draw: ImageDraw.ImageDraw) -> None:
-    x = OUT_W * SUPERSAMPLE - 8 * SUPERSAMPLE
+    x: float = OUT_W * SUPERSAMPLE - 8 * SUPERSAMPLE
     y = OUT_H * SUPERSAMPLE - 12 * SUPERSAMPLE
     for identity in reversed(tuple(IDENTITIES.values())):
         width = draw.textlength(identity.name, font=FONT_SMALL)
@@ -394,12 +815,20 @@ def _draw_legend(draw: ImageDraw.ImageDraw) -> None:
         x -= 22 * SUPERSAMPLE
 
 
-def render(frames: Sequence[VisualFrame]) -> list[Image.Image]:
+def render(shots: Sequence[Shot]) -> list[Image.Image]:
     images: list[Image.Image] = []
     trails: dict[str, deque[tuple[float, AgentSprite]]] = {}
     size = (OUT_W * SUPERSAMPLE, OUT_H * SUPERSAMPLE)
-    for frame in frames:
+    for shot in shots:
+        frame = shot.frame
         canvas = Image.new("RGBA", size, (*BG, 255))
+        backdrop = ImageDraw.Draw(canvas)
+        backdrop.rectangle((0, 0, _sx(WORLD.width), _sx(WORLD.height)), fill=PAGE_BG)
+        page = Image.new("RGBA", size, (0, 0, 0, 0))
+        mirror = ImageDraw.Draw(page)
+        for section in shot.sections:
+            _draw_section(mirror, section)
+        canvas.alpha_composite(page)
         layer = Image.new("RGBA", size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(layer)
         for overlay in frame.scene.overlays:
@@ -417,9 +846,11 @@ def render(frames: Sequence[VisualFrame]) -> list[Image.Image]:
             _draw_agent(draw, agent)
         for badge in frame.badges:
             _draw_badge(draw, badge)
+        _draw_hud(draw, shot.hud, frame.t_ms)
         draw.text(
             (10 * SUPERSAMPLE, (OUT_H - 12) * SUPERSAMPLE),
-            "Swarm Canvas  \N{MIDDLE DOT}  live session replay",
+            "Swarm Canvas  \N{MIDDLE DOT}  live DOM mirror, telemetry and HUD  \N{MIDDLE DOT}"
+            "  scripted session replay",
             font=FONT_LABEL,
             fill=MUTED,
             anchor="lm",
@@ -1129,6 +1560,286 @@ def locks_svg() -> str:
     return "\n".join(parts) + "\n"
 
 
+# --- time travel and forking ----------------------------------------------------------------
+
+SOURCE_COMMITS: Final = 20
+FORK_AT: Final = 11
+FORK_COMMITS: Final = 3
+SCRUB_TO: Final = 18
+FORK_AUTHORS: Final = ("agent-coder", "agent-architect", "agent-styler")
+FORK_TARGETS: Final = ("hero", "pricing", "features")
+
+
+@dataclass(frozen=True, slots=True)
+class ForkMeasurement:
+    source_frames: int
+    fork_frames: int
+    shared_frames: int
+    shared_patches: int
+    shared_bytes: int
+    own_frames: int
+    source_unchanged: bool
+    authors: tuple[str, ...]
+
+
+def _retitle(session_id: str, agent_id: str, target: str, title: str, seq: int) -> StreamDelta:
+    index = [component.id for component in BUNDLE.frontend.components].index(target)
+    return StreamDelta(
+        session_id=session_id,
+        agent_id=agent_id,
+        delta_seq=seq,
+        target_domain="frontend",
+        target_id=target,
+        patches=(
+            PatchOperation.model_validate(
+                {"op": "replace", "path": f"/frontend/components/{index}/title", "value": title}
+            ),
+        ),
+        emitted_at_ms=0,
+    )
+
+
+async def measure_fork() -> ForkMeasurement:
+    """Fork a real session on the real hub, and count what the branch shares with its source."""
+    hub = SwarmSessionHub(Settings(gateway_secret=SecretStr("asset-generation-only-" + "0" * 24)))
+    await hub.create_session("source", BUNDLE)
+    for agent, target in zip(FORK_AUTHORS, FORK_TARGETS, strict=True):
+        await hub.lock_manager("source").acquire(target, agent, 70, hub.now_ms())
+    authors = []
+    for seq in range(SOURCE_COMMITS):
+        agent, target = FORK_AUTHORS[seq % 3], FORK_TARGETS[seq % 3]
+        authors.append(agent)
+        await hub.apply_delta("source", _retitle("source", agent, target, f"Draft {seq}", seq))
+    before = hub.timeline("source")
+    await hub.fork_session("source", "fork", FORK_AT)
+    await hub.lock_manager("fork").acquire("pricing", "user:alice", 95, hub.now_ms())
+    for seq in range(FORK_COMMITS):
+        delta = _retitle("fork", "user:alice", "pricing", f"Alice {seq}", 100 + seq)
+        await hub.apply_delta("fork", delta)
+    source, fork = hub.timeline("source"), hub.timeline("fork")
+    shared = sum(a is b for a, b in zip(fork.snapshots, source.snapshots, strict=False))
+    measurement = ForkMeasurement(
+        source_frames=len(source.snapshots),
+        fork_frames=len(fork.snapshots),
+        shared_frames=shared,
+        shared_patches=sum(
+            a.patches is b.patches for a, b in zip(fork.deltas, source.deltas, strict=False)
+        ),
+        shared_bytes=sum(bundle_size(frame.bundle_state) for frame in fork.snapshots[:shared]),
+        own_frames=len(fork.snapshots) - shared,
+        source_unchanged=source == before,
+        authors=tuple(authors),
+    )
+    await hub.shutdown()
+    if not measurement.source_unchanged or measurement.shared_frames != FORK_AT + 1:
+        raise SystemExit(f"the fork did not behave as documented: {measurement}")
+    return measurement
+
+
+def forking_svg() -> str:
+    m = asyncio.run(measure_fork())
+    width, height = 1280, 610
+    left, step = 120, 52
+    source_y, fork_y, scrub_y = 190, 330, 470
+    colors = {identity.agent_id: identity.color for identity in IDENTITIES.values()}
+    alice = human_color("alice")
+
+    def fx(frame: int) -> float:
+        return left + frame * step
+
+    parts = _svg_open(
+        width,
+        height,
+        "Time travel and reality forking",
+        f"A session of {SOURCE_COMMITS} commits on the real hub, forked at frame {FORK_AT}. The"
+        f" fork shares frames 0 to {FORK_AT} with its source by reference, {m.shared_frames}"
+        f" frames and {m.shared_bytes:,} bytes of canonical state, none of it copied, then"
+        f" commits {m.own_frames} frames of its own while the source stays unchanged. Below, the"
+        f" scrubber rebuilds frame {SCRUB_TO} from the checkpoint at frame"
+        f" {SCRUB_TO - SCRUB_TO % HISTORY_CHECKPOINT_EVERY} plus"
+        f" {SCRUB_TO % HISTORY_CHECKPOINT_EVERY} patch replays.",
+    )
+    parts.append(_text(30, 40, "Time travel and reality forking", size=18, weight=700, fill=INK))
+    parts.append(
+        _text(
+            30,
+            62,
+            f"Measured on the real hub: a {SOURCE_COMMITS}-commit session forked at frame"
+            f" {FORK_AT}. Frames are immutable, so a fork costs a reference per frame, not a copy.",
+            size=12,
+            fill=INK_FAINT,
+        )
+    )
+    # The shared prefix, bracketed across both lanes.
+    shared_right = fx(FORK_AT) + 18
+    parts.append(
+        f'<rect x="{left - 22}" y="{source_y - 34}" width="{shared_right - left + 22}"'
+        f' height="{fork_y - source_y + 62}" rx="14" fill="#8B5CF6" fill-opacity="0.07"'
+        f' stroke="#8B5CF6" stroke-opacity="0.45" stroke-dasharray="5 4"/>'
+    )
+    parts.append(
+        _text(
+            left - 10,
+            source_y - 44,
+            f"Shared by reference: frames 0–{FORK_AT}  ·  {m.shared_frames} frames,"
+            f" {m.shared_patches} patch lists, {m.shared_bytes:,} bytes of state"
+            "  ·  0 bytes copied",
+            size=12,
+            weight=600,
+            fill="#C4B5FD",
+        )
+    )
+    for label, y, sub in (
+        ("Source", source_y, f"{m.source_frames} frames"),
+        ("Fork", fork_y, f"{m.fork_frames} frames"),
+    ):
+        parts.append(_text(30, y - 2, label, size=13, weight=700, fill=INK))
+        parts.append(_text(30, y + 14, sub, size=11, fill=INK_FAINT))
+    parts.append(
+        f'<line x1="{fx(0)}" y1="{source_y}" x2="{fx(SOURCE_COMMITS)}" y2="{source_y}"'
+        f' stroke="{GRID}" stroke-width="2"/>'
+    )
+    for frame in range(SOURCE_COMMITS + 1):
+        color = INK_FAINT if frame == 0 else colors[m.authors[frame - 1]]
+        parts.append(f'<circle cx="{fx(frame)}" cy="{source_y}" r="9" fill="{color}"/>')
+        parts.append(
+            _text(
+                fx(frame),
+                source_y + 28,
+                str(frame),
+                size=10,
+                fill=INK_FAINT,
+                anchor="middle",
+                mono=True,
+            )
+        )
+    # The fork's lane: the shared prefix as ghosts of the same objects, then its own frames.
+    for frame in range(FORK_AT + 1):
+        parts.append(
+            f'<line x1="{fx(frame)}" y1="{source_y + 11}" x2="{fx(frame)}" y2="{fork_y - 11}"'
+            f' stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>'
+        )
+        parts.append(
+            f'<circle cx="{fx(frame)}" cy="{fork_y}" r="8.5" fill="none" stroke="#8B5CF6"'
+            f' stroke-opacity="0.7" stroke-dasharray="3 2"/>'
+        )
+    last = FORK_AT + m.own_frames
+    parts.append(
+        f'<path d="M {fx(FORK_AT)} {source_y + 10} C {fx(FORK_AT) + 30} {source_y + 70},'
+        f' {fx(FORK_AT + 1) - 20} {fork_y - 60}, {fx(FORK_AT + 1)} {fork_y}" fill="none"'
+        f' stroke="{alice}" stroke-width="2"/>'
+    )
+    parts.append(
+        f'<line x1="{fx(FORK_AT + 1)}" y1="{fork_y}" x2="{fx(last)}" y2="{fork_y}"'
+        f' stroke="{alice}" stroke-width="2"/>'
+    )
+    for frame in range(FORK_AT + 1, last + 1):
+        parts.append(f'<circle cx="{fx(frame)}" cy="{fork_y}" r="9" fill="{alice}"/>')
+        parts.append(
+            _text(
+                fx(frame),
+                fork_y + 28,
+                f"{frame}′",
+                size=10,
+                fill=INK_FAINT,
+                anchor="middle",
+                mono=True,
+            )
+        )
+    parts.append(
+        _text(
+            fx(last) + 22,
+            fork_y - 4,
+            f"POST /api/v1/sessions/source/fork?from_seq={FORK_AT}",
+            size=11,
+            fill=INK,
+            mono=True,
+        )
+    )
+    parts.append(
+        _text(
+            fx(last) + 22,
+            fork_y + 12,
+            f"{m.own_frames} commits of its own, by a person at priority 95.",
+            size=11,
+            fill=INK_MUTED,
+        )
+    )
+    parts.append(
+        _text(
+            fx(last) + 22,
+            fork_y + 27,
+            "The source is unchanged, frame for frame.",
+            size=11,
+            fill=INK_MUTED,
+        )
+    )
+    # The scrubber, rebuilding a frame from the nearest checkpoint.
+    parts.append(_text(30, scrub_y - 2, "Scrubber", size=13, weight=700, fill=INK))
+    parts.append(_text(30, scrub_y + 14, "GET …/history", size=11, fill=INK_FAINT, mono=True))
+    parts.append(
+        f'<rect x="{fx(0)}" y="{scrub_y - 3}" width="{fx(SOURCE_COMMITS) - fx(0)}" height="6"'
+        f' rx="3" fill="{GRID}"/>'
+    )
+    parts.append(
+        f'<rect x="{fx(0)}" y="{scrub_y - 3}" width="{fx(SCRUB_TO) - fx(0)}" height="6" rx="3"'
+        f' fill="#8B5CF6"/>'
+    )
+    checkpoint = SCRUB_TO - SCRUB_TO % HISTORY_CHECKPOINT_EVERY
+    for frame in range(0, SOURCE_COMMITS + 1, HISTORY_CHECKPOINT_EVERY):
+        parts.append(
+            f'<rect x="{fx(frame) - 5}" y="{scrub_y - 14}" width="10" height="10" rx="2"'
+            f' fill="{INK if frame == checkpoint else INK_FAINT}"'
+            f' transform="rotate(45 {fx(frame)} {scrub_y - 9})"/>'
+        )
+    parts.append(
+        f'<path d="M {fx(checkpoint)} {scrub_y + 14} C {fx(checkpoint)} {scrub_y + 34},'
+        f' {fx(SCRUB_TO)} {scrub_y + 34}, {fx(SCRUB_TO)} {scrub_y + 14}" fill="none"'
+        f' stroke="{INK_MUTED}" stroke-dasharray="3 3"/>'
+    )
+    parts.append(f'<circle cx="{fx(SCRUB_TO)}" cy="{scrub_y}" r="8" fill="{INK}"/>')
+    note_x = (fx(checkpoint) + fx(SCRUB_TO)) / 2
+    parts.append(
+        _text(
+            note_x,
+            scrub_y + 52,
+            f"Frame {SCRUB_TO} = checkpoint {checkpoint} + {SCRUB_TO - checkpoint} patch replays",
+            size=11,
+            fill=INK,
+            anchor="middle",
+        )
+    )
+    parts.append(
+        _text(
+            note_x,
+            scrub_y + 68,
+            f"A checkpoint every {HISTORY_CHECKPOINT_EVERY} frames: never more than"
+            f" {HISTORY_CHECKPOINT_EVERY - 1} replays.",
+            size=11,
+            fill=INK_MUTED,
+            anchor="middle",
+        )
+    )
+    legend_y = height - 22
+    x = 30.0
+    for identity_id in FORK_AUTHORS:
+        name = next(i.name for i in IDENTITIES.values() if i.agent_id == identity_id)
+        parts.append(
+            f'<circle cx="{x + 5}" cy="{legend_y - 4}" r="5" fill="{colors[identity_id]}"/>'
+        )
+        parts.append(_text(x + 16, legend_y, name, size=11))
+        x += 30 + 7 * len(name)
+    parts.append(f'<circle cx="{x + 5}" cy="{legend_y - 4}" r="5" fill="{alice}"/>')
+    parts.append(_text(x + 16, legend_y, "alice, a person", size=11))
+    parts.append(
+        f'<rect x="{x + 140}" y="{legend_y - 12}" width="10" height="10" rx="2" fill="{INK_FAINT}"'
+        f' transform="rotate(45 {x + 145} {legend_y - 7})"/>'
+    )
+    parts.append(_text(x + 160, legend_y, "history checkpoint", size=11))
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
     frames = asyncio.run(simulate())
@@ -1139,7 +1850,8 @@ def main() -> None:
     SVG_PATH.write_text(topology_svg())
     CONVERGENCE_PATH.write_text(convergence_svg())
     LOCKS_PATH.write_text(locks_svg())
-    for path in (GIF_PATH, SVG_PATH, CONVERGENCE_PATH, LOCKS_PATH):
+    FORKING_PATH.write_text(forking_svg())
+    for path in (GIF_PATH, SVG_PATH, CONVERGENCE_PATH, LOCKS_PATH, FORKING_PATH):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
         print(f"{path.relative_to(ROOT)}  {path.stat().st_size:>9,} bytes  sha256 {digest}")
 

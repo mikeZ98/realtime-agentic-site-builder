@@ -11,12 +11,15 @@ compiles into a runnable, byte-reproducible repository.
 ![Ruff](https://img.shields.io/badge/lint-ruff-D7FF64?logo=ruff&logoColor=black)
 ![Network-free tests](https://img.shields.io/badge/tests-network--free-8B5CF6)
 
-![Six agents working a shared canvas: Bézier cursor trails, lock overlays with owner badges, a contention pulse, docked thought badges and a person's presence marker](docs/assets/swarm-live-demo.gif)
+![Six agents working a shared canvas over a live mirror of the site they are building: sections retitle as commits land, each with a spring kick and a halo in its author's color, under Bézier cursor trails, lock outlines, docked thought badges and a heads-up display whose graph radar pulses on a critic's rejection](docs/assets/swarm-live-demo.gif)
 
-<sub>The GIF is rendered from the platform's own cursor simulator, lock manager and canvas
-compositor running a scripted session, by
+<sub>The GIF is rendered from the platform's own cursor simulator, lock manager, patch engine and
+canvas compositor running a scripted session, by
 [`scripts/generate-demo-assets.py`](scripts/generate-demo-assets.py). It is not a screen
-recording or a hand-made animation.</sub>
+recording or a hand-made animation. The mirrored sections are rebuilt from exactly the patches
+and corrections a viewer is sent, and the generator stops if they ever differ from what the
+engine committed. Its HUD shows only what a simulation can derive; the live page adds token
+spend and measured latency.</sub>
 
 ---
 
@@ -25,6 +28,7 @@ recording or a hand-made animation.</sub>
 - [What it does](#what-it-does)
 - [Proof of engineering](#proof-of-engineering)
 - [Architecture](#architecture)
+- [The live canvas: mirror, HUD, time travel](#the-live-canvas-mirror-hud-time-travel)
 - [Protocol: `rasb.v1`](#protocol-rasbv1)
 - [REST API and errors](#rest-api-and-errors)
 - [Quickstart](#quickstart)
@@ -40,7 +44,10 @@ recording or a hand-made animation.</sub>
 | **Safe concurrent editing** | Every change is an RFC 6902 patch. The hub commits it only if its author holds a live lock on the target, on every element each pointer resolves to, and on everything the result changes. Deadlocks are broken by rank. |
 | **Live multiplayer** | One WebSocket carries state, lock changes, presence and a lossless, sequenced thought stream. Reconnecting clients resume from the last thought they saw. |
 | **Read-only viewers** | Anyone in the tenant can watch and show presence. Only a session's owner can prompt, lock, edit or delete. |
-| **Visual canvas** | `GET /canvas/{id}` serves a self-contained HTML5 canvas: Bézier trails, Hermite dead reckoning, lock overlays, docked thought badges. Under 20 KB, no external requests, hash-based CSP. |
+| **Visual canvas** | `GET /canvas/{id}` serves one self-contained page: a live DOM mirror of the site, kept current by RFC 6902 patches, under a telemetry layer of Bézier trails, Hermite dead reckoning, lock outlines and docked thought badges. Under 64 KB, no external requests, hash-based CSP. |
+| **Time travel and forking** | Scrub a session's retained history in the browser, and fork any frame into a new session of your own with `POST /api/v1/sessions/{id}/fork?from_seq=N`. A fork shares its past with its source rather than copying it. |
+| **Human override** | The owner can take any element from an agent at once (`lock.override`, priority 95, above the Architect's 90). The agent is told why, and every viewer sees it happen. |
+| **Runtime verification** | `GET /api/v1/sessions/{id}/verify` checks seven safety invariants against the session's recorded history, and names where any of them broke. |
 | **Operable** | Every request and socket gets an `X-Request-ID` that appears in problem documents and log records. `/healthz` for orchestrators, and `/metrics` in the Prometheus format. |
 | **Runnable export** | `GET /api/v1/sessions/{id}/export` compiles the session into a FastAPI + SQLAlchemy + Alembic backend and a Vite + React 19 + Tailwind frontend with a typed API client, as a deterministic ZIP or tar.gz. |
 
@@ -51,8 +58,12 @@ as marked.
 
 | Property | Result | Source |
 |---|---|---|
-| Line and branch coverage | **100.00%** across 1,475 tests | Enforced: [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) fails on any regression |
-| Mutation testing | **534 of 548** mutants killed (97.45%) across the locking, patching, hub, auth, motion, compositing and export modules. **All 534** that a test could tell apart are killed; the other 14 are equivalent, each with its reason | Measured: [`scripts/mutation-test.py`](scripts/mutation-test.py), run on demand, about 5 minutes |
+| Line and branch coverage | **100.00%** across 1,525 tests | Enforced: [`scripts/coverage-gate.sh`](scripts/coverage-gate.sh) fails on any regression |
+| Lock protocol, exhaustively | **Every** reachable state of the real lock manager, for two agents, a person and two elements: **41,211** states and **576,954** transitions, each checked for mutual exclusion, no orphaned queue, no surviving wait cycle, no unannounced loss of a live hold and best-ranked promotion. It catches each of 5 deliberately planted protocol bugs | Enforced: [`tests/unit/test_model_checking.py`](tests/unit/test_model_checking.py). The planted bugs were measured once |
+| Exact DOM mirror | Patches, then the server's corrections, reproduce **every** committed layout of a 400-step random workload, value for value | Enforced: [`tests/unit/test_mirror.py`](tests/unit/test_mirror.py) |
+| Page ↔ engine patch parity | The viewer's own RFC 6902 code agrees with the patch engine on **4,000** random operations, success and failure alike, and rebuilds **every** commit of a 300-step workload | Enforced by the suite when Node is installed, skipped otherwise |
+| Zero-copy forks | Forking a 20-commit session at frame 11 shares **12 frames** (**29,149 bytes** of state) by reference and copies none; the source is unchanged | Enforced: frame identity in [`tests/unit/test_breakthrough.py`](tests/unit/test_breakthrough.py). Sizes measured by the asset generator |
+| Mutation testing | **604 of 620** mutants killed (97.42%) across the locking, patching, hub, invariant monitor, auth, motion, compositing, mirror and export modules. **All 604** that a test could tell apart are killed; the other 16 are equivalent, each with its reason | Measured: [`scripts/mutation-test.py`](scripts/mutation-test.py), run on demand, about 5 minutes |
 | Canvas frame pacing | **60.0 FPS** on a fixed schedule, p95 interval **18.3 ms**, under a flood of ~600 thoughts/s | Measured. The chaos suite enforces > 54 FPS and p95 < 41.7 ms while a stalled client is evicted |
 | Motion under 50% packet loss | Median error **≈ 1 px**. After a burst, the visible jump stays **under 1/8** of the error the coast accumulated | Enforced: [`tests/unit/test_canvas.py`](tests/unit/test_canvas.py), 5 seeded loss patterns |
 | Python ↔ JavaScript motion parity | **0.000000 px** divergence over 2,400 frames at 50% loss | Measured with an out-of-tree Node harness. Not part of CI, which runs no JavaScript |
@@ -65,7 +76,7 @@ as marked.
 | Replay integrity | Re-applying the patch log reproduces **every** recorded state hash | Enforced: lifecycle suite |
 
 The test suite opens no network sockets (`pytest-socket` blocks them), makes no model calls, and
-runs in about 30 seconds.
+runs in about 75 seconds with coverage, a fifth of it the exhaustive model check.
 
 ## Architecture
 
@@ -153,6 +164,12 @@ then the older Lamport timestamp, then the agent id.
 | 6 | Styler | 40 |
 | 7 | Critic | 30 |
 
+The one exception is the **human override**. The session's owner can send `lock.override`, which
+takes an element at priority 95, above every agent, from a live holder of lower priority. The
+holder loses only that element and gets a `PREEMPTED` event with the reason, and everyone else
+gets an `OVERRIDDEN` one, which the canvas shows as an alert in the person's color. Against a
+holder of equal or higher priority, or no holder at all, it is an ordinary `lock.acquire`.
+
 Locks are path-level. A lock on component `hero` does not cover the site title, which belongs
 to `frontend:document`, or any other component.
 
@@ -209,6 +226,83 @@ that would keep the exported service from starting or building: an unresolvable 
 undefined name, a reserved field name, a component importing a package that isn't declared.
 Package names are never added automatically, because models invent convincing ones.
 
+## The live canvas: mirror, HUD, time travel
+
+### A live mirror of the site, not a preview
+
+Behind the telemetry layer, the canvas page draws the site the agents are building, at each
+section's real coordinates and in the site's theme. Each section is a skeleton for its kind of
+component with its real title. The generated code is never run: language models wrote it, so the
+page holds it as data, builds every element with `createElement`, and writes text only through
+`textContent`. Its policy allows no other script anyway.
+
+It stays current without reloading anything. `canvas.hello` carries the layout at a frame, and
+every later commit arrives as a `canvas.delta` holding its RFC 6902 patches. The page applies them
+to its own copy, all or nothing, then changes only the DOM nodes whose title, kind or box differs.
+Patches alone are not quite enough: after applying them the engine stamps each component's
+version and checksum, and validation normalizes text (NFKC, entity decoding, injection
+stripping), none of which a browser can reproduce exactly. So the server works out what is left
+and sends it as more patches, `corrections`. With them the copy equals the committed layout,
+value for value, as the suite checks against the real engine. A missed frame shows up as a gap
+in `frame_seq`, and the page rebuilds from `GET …/history` before applying what it had queued.
+
+A section that is committed to, or taken by a new holder, gets a kick: a spring impulse that
+grows with the speed of the cursor that delivered it and pushes along its path, and a halo in
+the author's color. The spring is underdamped (stiffness 260/s², damping 16/s, damping ratio 0.5)
+and rings down within 490 ms. Locked sections keep a soft halo in their holder's color.
+With `prefers-reduced-motion` set nothing moves: sections only glow, and the radar's rings fade
+in place.
+
+### Heads-up display
+
+Press **H**, or use the toolbar.
+
+| Readout | What it shows, and how it is measured |
+|---|---|
+| Graph state | A radar with one axis per LangGraph node, scaled by how often each has run. Running nodes pulse. A critic's rejection sends a red ring out from the center, an approval a green one |
+| Burn | Tokens reported by the thoughts this view has received, and their cost in USD to $0.0001. Cost appears only for calls whose model has a price in `RASB_MODEL_PRICES`, with the share of tokens priced when that is not all of them. Nothing is priced by default |
+| Latency | Socket round trip p95 and p99, from a ping a second while the HUD is open, and frame arrival to paint p95 and p99. Not commit-to-screen latency: the server's and browser's clocks are not synchronized |
+| Timeline | The frame the mirror holds, and the commits it has applied |
+| Verify invariants | Runs `GET …/verify` and lists every invariant with what it checked |
+| Human override | Owner only. Select an element on the canvas, then **O** to take it or **R** to release it |
+
+### Time travel and forking
+
+![Time travel and reality forking: a 20-commit session forked at frame 11. The fork shares frames 0 to 11 with its source by reference, 12 frames and 29,149 bytes of state with none copied, then commits three frames of its own. The scrubber rebuilds frame 18 from the checkpoint at frame 16 plus two patch replays](docs/assets/time-travel-forking.svg)
+
+<sub>Measured by the asset generator on the real hub. The diagram stops if the fork shares
+fewer frames than documented, or if the source changes.</sub>
+
+Press **T** for the timeline. `GET …/history` returns the retained window compactly: one base
+layout, then each delta with its corrections and the lock table after it. The page rebuilds any
+frame by patching forward from the nearest checkpoint, one every 16 frames, so a scrub never
+replays more than 15 deltas, and outlines the locks held at that frame. **Esc** returns to live.
+
+**Fork from here** branches the frame on screen into a new session with
+`POST …/fork?from_seq=N`, and opens it with the same token. Frames and the bundles in them are
+immutable, so the fork shares its past with its source instead of copying it: the cost is a
+reference per frame, whatever the bundle's size. The fork starts with no locks, thoughts, run or
+clients, belongs to whoever made it, and counts toward their session limit. Forking leaves its
+source untouched, so any viewer may fork a session they can watch.
+
+### Runtime invariant monitor
+
+`GET …/verify` checks the session's recorded history, not what the code meant to do, so a defect
+anywhere upstream shows up as a named violation at a frame:
+
+| Invariant | Holds when |
+|---|---|
+| `log-complete` | Every frame after the first has exactly one delta that produced it |
+| `frames-contiguous` | Frame numbers rise by exactly one |
+| `deltas-ordered` | Delta sequence numbers strictly increase |
+| `mutual-exclusion` | No frame records two holders of one element |
+| `commits-locked` | Every delta's author held its target when it committed |
+| `leases-live` | And that hold had not lapsed |
+| `replay-exact` | Replaying the log from its first frame reproduces every recorded hash |
+
+It runs in time linear in the log, plus one patch application per delta, off the event loop and
+within the same concurrency limit as exports.
+
 ## Protocol: `rasb.v1`
 
 Connect to `/ws/sessions/{session_id}` offering two subprotocols: `rasb.v1`, and
@@ -234,6 +328,7 @@ outright. Identity comes only from the verified token.
 | `select` | `target_id` or `null` | anyone |
 | `lock.acquire` | `target_id` | owner |
 | `lock.release` | `target_id` | owner |
+| `lock.override` | `target_id` | owner. Takes the element at priority 95 from a live holder of lower priority. Against anyone else, the same as `lock.acquire` |
 | `delta` | `target_domain` (`frontend` or `backend`), `target_id`, `patches` (RFC 6902) | owner |
 | `prompt` | `text` (1 to 4,096 characters) | owner |
 
@@ -247,13 +342,15 @@ Beyond either, the reply is a 429 `capacity-exceeded` problem.
 | `kind` | Stream | Carries |
 |---|---|---|
 | `sync` | default | First frame: `session_id`, verified `user_id` and `agent_id`, full `snapshot`, `latest_thought_seq`, `replayed_thoughts`, `thought_gap` |
-| `thought` | default | `seq` (contiguous per session) and `thought`: agent, role, text, tool name, tool arguments, tokens, latency |
+| `thought` | default | `seq` (contiguous per session) and `thought`: agent, role, text, tool name, tool arguments, tokens, latency, and `cost_usd` when the model is priced |
 | `state` | default | The committed `delta` and the resulting `snapshot`, with its `bundle_hash` |
-| `lock` | default | `event.kind` is `PROMOTED`, `PREEMPTED` or `TIMED_OUT`, with the `lock` and an RFC 9457 `problem` for the loser |
+| `lock` | default | `event.kind` is `PROMOTED`, `PREEMPTED`, `TIMED_OUT` or `OVERRIDDEN`, with the `lock` and an RFC 9457 `problem` for the loser |
 | `cursor` | default | One agent's `frame`: position, action, current thought, active lock |
 | `presence` | default | A person's `user_id`, `x`, `y`, `selected_id`, `active` |
-| `canvas.hello` | canvas | `session_id`, `user_id`, `agent_id`, `is_owner`, `latest_thought_seq`, `replayed_thoughts`, `thought_gap` |
-| `canvas.thought` | canvas | `seq`, `agent_id`, `label`, `color`, `text` (at most 200 characters), `tool_name`. Each one sent once, in order |
+| `canvas.hello` | canvas | `session_id`, `user_id`, `agent_id`, `is_owner`, `latest_thought_seq`, `replayed_thoughts`, `thought_gap`, and the `frontend` layout as of `frame_seq` |
+| `canvas.thought` | canvas | `seq`, `agent_id`, `label`, `color`, `text` (at most 200 characters), `tool_name`, the graph `node` it entered or left, a critic's `approved`, `tokens`, `cost_usd`. Each one sent once, in order |
+| `canvas.delta` | canvas | A commit: `frame_seq`, `delta_seq`, `agent_id`, `target_id`, the author's `color`, `target_domain`, and for the frontend its `patches` and `corrections`. Each one sent once, in order |
+| `canvas.override` | canvas | `target_id`, and `by`: the person who took it, with their `label` and `color` |
 | `canvas` | canvas | `t_ms`, `agents` (position, velocity in px/s, action, dock), `humans`, `badges` (phase, opacity), and `scene` (viewport, lock overlays) only when it changed |
 | `ack` | both | `request_id`, `type`, and `lock` or `frame_seq` where relevant |
 | `pong` | both | `request_id`, `server_time_ms` |
@@ -282,6 +379,9 @@ Every route needs `Authorization: Bearer <token>`. The interactive schema is at 
 | `POST /api/v1/sessions` | Create a session. Optional body: `prompt` starts a run, `bundle` sets the starting state | `201` with `session_id`, `snapshot`, `run_started`, and a `Location` header |
 | `GET /api/v1/sessions/{id}` | Latest snapshot | `200` |
 | `GET /api/v1/sessions/{id}/timeline` | Every delta and frame, plus the thought backlog | `200` |
+| `GET /api/v1/sessions/{id}/history` | The retained window, compactly: the base frame's layout and locks, then each delta with its `corrections` and the lock table after it | `200` |
+| `GET /api/v1/sessions/{id}/verify` | Check seven safety invariants against the recorded history. Runs in the thread pool, within `RASB_GATEWAY_MAX_CONCURRENT_EXPORTS` | `200` with each invariant, what it checked, and up to 5 violations |
+| `POST /api/v1/sessions/{id}/fork?from_seq=N` | Branch frame `N` into a new session owned by the caller. Any tenant user may fork, within their session limit | `201` with `session_id`, `snapshot`, `run_started`, and a `Location` header |
 | `GET /api/v1/sessions/{id}/export?format=zip` | Compile and download the project. `format` is `zip` or `tar.gz` | `200`, streamed `application/zip` or `application/gzip` |
 | `DELETE /api/v1/sessions/{id}` | End the session, its run, ticker and connections. Owner only | `204` |
 | `GET /canvas/{id}` | The canvas viewer page. No token: it is static, and the socket authenticates | `200` `text/html` |
@@ -315,7 +415,7 @@ the handshake that opened it, and a support ticket quoting a `trace_id` leads st
 | 400 | `endpoint-binding-not-found` |
 | 401 | `authentication-required` (with `WWW-Authenticate: Bearer`) |
 | 403 | `permission-denied` |
-| 404 | `session-not-found` |
+| 404 | `session-not-found` · `frame-not-retained`, for a fork outside the retained window, with `frame_seq`, `earliest` and `latest` |
 | 408 | `lock-acquisition-timeout` |
 | 409 | `element-lock-conflict` · `delta-rejected` · `run-already-active` · `session-already-exists` |
 | 413 | `bundle-too-large`, on creation or when a delta would grow the bundle past `RASB_MAX_BUNDLE_BYTES` · `about:blank` for a body over `RASB_MAX_REQUEST_BYTES`, refused from its declared length before any of it is read |
@@ -379,6 +479,10 @@ subprotocol. Share the link with a token for another user and they join as a rea
 with a presence marker. Reloading the page asks for the token again, by design: it is never
 written to storage.
 
+On the canvas, **H** toggles the heads-up display, **T** opens the timeline (**Esc** returns to
+live), and the owner can select an element and press **O** to take it from an agent or **R** to
+release it.
+
 ### Export the project
 
 ```sh
@@ -420,6 +524,7 @@ Settings are read from `RASB_`-prefixed environment variables.
 | `RASB_WS_HEARTBEAT_TIMEOUT_SECONDS` | 60 | Silence allowed before a socket is closed |
 | `RASB_WS_MAX_MESSAGES_PER_SECOND` · `_MAX_MESSAGE_BYTES` | 120 · 128 KiB | Per-connection ingress limits |
 | `RASB_MAX_REQUEST_BYTES` | 10 MiB | REST body limit |
+| `RASB_MODEL_PRICES` | none | JSON object from the model id a provider reports to `{"input_usd_per_mtok": …, "output_usd_per_mtok": …}`. Calls to a priced model report `cost_usd`. Nothing is priced by default, because prices change |
 
 ## Development
 
@@ -462,11 +567,11 @@ missing test or an equivalent mutant, and equivalents are listed in the script w
 | Path | Contents |
 |---|---|
 | `src/realtime_agentic_site_builder/domain/` | Strict, immutable Pydantic models, hashing, RFC 9457 errors |
-| `src/realtime_agentic_site_builder/core/` | Session hub, patch engine, lock manager, event bus |
+| `src/realtime_agentic_site_builder/core/` | Session hub, patch engine, lock manager, event bus, invariant monitor |
 | `src/realtime_agentic_site_builder/agents/` | LangGraph swarm, nodes, tiered LLM provider, TSX checker |
 | `src/realtime_agentic_site_builder/simulation/` | Bézier cursor motion and the frame ticker |
 | `src/realtime_agentic_site_builder/gateway/` | FastAPI app, auth, WebSocket protocol and connections |
-| `src/realtime_agentic_site_builder/canvas/` | Projection, dead reckoning, compositor, viewer page |
+| `src/realtime_agentic_site_builder/canvas/` | Projection, dead reckoning, compositor, mirror corrections, viewer page |
 | `src/realtime_agentic_site_builder/synthesis/` | Project compiler and deterministic archive exporter |
 | `tests/unit/`, `tests/integration/` | Unit suites, hardening and contract tests, and end-to-end lifecycle and chaos scenarios |
 
@@ -486,7 +591,12 @@ missing test or an equivalent mutant, and equivalents are listed in the script w
 - **Exports carry no lockfiles.** Generated `package.json` and `pyproject.toml` pin version
   ranges, so dependency resolution happens when the project is installed. The generated
   Dockerfile has not been built in CI.
-- **TypeScript is checked structurally in CI**, since the suite runs no JavaScript toolchain.
+- **TypeScript is checked structurally in CI**, since the suite needs no JavaScript toolchain.
+  Node, when installed, runs only the canvas page's own patch code against the engine.
   Bracket and tag balance, import resolution and declared dependencies are verified; type
   checking happens when the exported project runs `tsc`.
+- **Forks start quiet.** A fork has the source's history but none of its locks, thoughts or run.
+  Its owner starts a new run with a `prompt`.
+- **The HUD measures hops, not end to end.** Round trip and arrival-to-paint are real browser
+  measurements; commit-to-screen latency would need synchronized clocks.
 - **Canvas tested in Chromium only.**

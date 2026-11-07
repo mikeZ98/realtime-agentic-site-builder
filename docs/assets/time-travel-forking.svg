@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 610" width="1280" height="610" role="img" aria-labelledby="t d">
+<title id="t">Time travel and reality forking</title>
+<desc id="d">A session of 20 commits on the real hub, forked at frame 11. The fork shares frames 0 to 11 with its source by reference, 12 frames and 29,149 bytes of canonical state, none of it copied, then commits 3 frames of its own while the source stays unchanged. Below, the scrubber rebuilds frame 18 from the checkpoint at frame 16 plus 2 patch replays.</desc>
+<style>text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; } .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }</style>
+<rect width="1280" height="610" rx="14" fill="#0B0F19"/>
+<text x="30.0" y="40.0" font-size="18" font-weight="700" fill="#E5E7EB" text-anchor="start">Time travel and reality forking</text>
+<text x="30.0" y="62.0" font-size="12" font-weight="400" fill="#64748B" text-anchor="start">Measured on the real hub: a 20-commit session forked at frame 11. Frames are immutable, so a fork costs a reference per frame, not a copy.</text>
+<rect x="98" y="156" width="612" height="202" rx="14" fill="#8B5CF6" fill-opacity="0.07" stroke="#8B5CF6" stroke-opacity="0.45" stroke-dasharray="5 4"/>
+<text x="110.0" y="146.0" font-size="12" font-weight="600" fill="#C4B5FD" text-anchor="start">Shared by reference: frames 0–11  ·  12 frames, 11 patch lists, 29,149 bytes of state  ·  0 bytes copied</text>
+<text x="30.0" y="188.0" font-size="13" font-weight="700" fill="#E5E7EB" text-anchor="start">Source</text>
+<text x="30.0" y="204.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start">21 frames</text>
+<text x="30.0" y="328.0" font-size="13" font-weight="700" fill="#E5E7EB" text-anchor="start">Fork</text>
+<text x="30.0" y="344.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start">15 frames</text>
+<line x1="120" y1="190" x2="1160" y2="190" stroke="#1F2937" stroke-width="2"/>
+<circle cx="120" cy="190" r="9" fill="#64748B"/>
+<text x="120.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">0</text>
+<circle cx="172" cy="190" r="9" fill="#3B82F6"/>
+<text x="172.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">1</text>
+<circle cx="224" cy="190" r="9" fill="#8B5CF6"/>
+<text x="224.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">2</text>
+<circle cx="276" cy="190" r="9" fill="#EC4899"/>
+<text x="276.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">3</text>
+<circle cx="328" cy="190" r="9" fill="#3B82F6"/>
+<text x="328.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">4</text>
+<circle cx="380" cy="190" r="9" fill="#8B5CF6"/>
+<text x="380.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">5</text>
+<circle cx="432" cy="190" r="9" fill="#EC4899"/>
+<text x="432.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">6</text>
+<circle cx="484" cy="190" r="9" fill="#3B82F6"/>
+<text x="484.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">7</text>
+<circle cx="536" cy="190" r="9" fill="#8B5CF6"/>
+<text x="536.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">8</text>
+<circle cx="588" cy="190" r="9" fill="#EC4899"/>
+<text x="588.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">9</text>
+<circle cx="640" cy="190" r="9" fill="#3B82F6"/>
+<text x="640.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">10</text>
+<circle cx="692" cy="190" r="9" fill="#8B5CF6"/>
+<text x="692.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">11</text>
+<circle cx="744" cy="190" r="9" fill="#EC4899"/>
+<text x="744.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">12</text>
+<circle cx="796" cy="190" r="9" fill="#3B82F6"/>
+<text x="796.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">13</text>
+<circle cx="848" cy="190" r="9" fill="#8B5CF6"/>
+<text x="848.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">14</text>
+<circle cx="900" cy="190" r="9" fill="#EC4899"/>
+<text x="900.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">15</text>
+<circle cx="952" cy="190" r="9" fill="#3B82F6"/>
+<text x="952.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">16</text>
+<circle cx="1004" cy="190" r="9" fill="#8B5CF6"/>
+<text x="1004.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">17</text>
+<circle cx="1056" cy="190" r="9" fill="#EC4899"/>
+<text x="1056.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">18</text>
+<circle cx="1108" cy="190" r="9" fill="#3B82F6"/>
+<text x="1108.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">19</text>
+<circle cx="1160" cy="190" r="9" fill="#8B5CF6"/>
+<text x="1160.0" y="218.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">20</text>
+<line x1="120" y1="201" x2="120" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="120" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="172" y1="201" x2="172" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="172" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="224" y1="201" x2="224" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="224" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="276" y1="201" x2="276" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="276" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="328" y1="201" x2="328" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="328" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="380" y1="201" x2="380" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="380" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="432" y1="201" x2="432" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="432" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="484" y1="201" x2="484" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="484" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="536" y1="201" x2="536" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="536" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="588" y1="201" x2="588" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="588" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="640" y1="201" x2="640" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="640" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<line x1="692" y1="201" x2="692" y2="319" stroke="#8B5CF6" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<circle cx="692" cy="330" r="8.5" fill="none" stroke="#8B5CF6" stroke-opacity="0.7" stroke-dasharray="3 2"/>
+<path d="M 692 200 C 722 260, 724 270, 744 330" fill="none" stroke="#98F797" stroke-width="2"/>
+<line x1="744" y1="330" x2="848" y2="330" stroke="#98F797" stroke-width="2"/>
+<circle cx="744" cy="330" r="9" fill="#98F797"/>
+<text x="744.0" y="358.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">12′</text>
+<circle cx="796" cy="330" r="9" fill="#98F797"/>
+<text x="796.0" y="358.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">13′</text>
+<circle cx="848" cy="330" r="9" fill="#98F797"/>
+<text x="848.0" y="358.0" font-size="10" font-weight="400" fill="#64748B" text-anchor="middle" class="mono">14′</text>
+<text x="870.0" y="326.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="start" class="mono">POST /api/v1/sessions/source/fork?from_seq=11</text>
+<text x="870.0" y="342.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">3 commits of its own, by a person at priority 95.</text>
+<text x="870.0" y="357.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">The source is unchanged, frame for frame.</text>
+<text x="30.0" y="468.0" font-size="13" font-weight="700" fill="#E5E7EB" text-anchor="start">Scrubber</text>
+<text x="30.0" y="484.0" font-size="11" font-weight="400" fill="#64748B" text-anchor="start" class="mono">GET …/history</text>
+<rect x="120" y="467" width="1040" height="6" rx="3" fill="#1F2937"/>
+<rect x="120" y="467" width="936" height="6" rx="3" fill="#8B5CF6"/>
+<rect x="115" y="456" width="10" height="10" rx="2" fill="#64748B" transform="rotate(45 120 461)"/>
+<rect x="947" y="456" width="10" height="10" rx="2" fill="#E5E7EB" transform="rotate(45 952 461)"/>
+<path d="M 952 484 C 952 504, 1056 504, 1056 484" fill="none" stroke="#94A3B8" stroke-dasharray="3 3"/>
+<circle cx="1056" cy="470" r="8" fill="#E5E7EB"/>
+<text x="1004.0" y="522.0" font-size="11" font-weight="400" fill="#E5E7EB" text-anchor="middle">Frame 18 = checkpoint 16 + 2 patch replays</text>
+<text x="1004.0" y="538.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="middle">A checkpoint every 16 frames: never more than 15 replays.</text>
+<circle cx="35.0" cy="584" r="5" fill="#3B82F6"/>
+<text x="46.0" y="588.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Frontend Coder</text>
+<circle cx="163.0" cy="584" r="5" fill="#8B5CF6"/>
+<text x="174.0" y="588.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Architect</text>
+<circle cx="256.0" cy="584" r="5" fill="#EC4899"/>
+<text x="267.0" y="588.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">Styler</text>
+<circle cx="328.0" cy="584" r="5" fill="#98F797"/>
+<text x="339.0" y="588.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">alice, a person</text>
+<rect x="463.0" y="576" width="10" height="10" rx="2" fill="#64748B" transform="rotate(45 468.0 581)"/>
+<text x="483.0" y="588.0" font-size="11" font-weight="400" fill="#94A3B8" text-anchor="start">history checkpoint</text>
+</svg>
