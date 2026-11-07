@@ -227,6 +227,21 @@ class DeltaRejectedError(SiteBuilderError):
         )
 
 
+class BundleTooLargeError(SiteBuilderError):
+    """A bundle that would cost too much to serialize, hash and keep, on every commit."""
+
+    status: ClassVar[int] = 413
+    title: ClassVar[str] = "Bundle too large"
+    slug: ClassVar[str] = "bundle-too-large"
+
+    def __init__(self, *, size_bytes: int, limit_bytes: int, instance: str | None = None) -> None:
+        super().__init__(
+            f"The bundle would be {size_bytes} bytes, over the limit of {limit_bytes}.",
+            instance=instance,
+            extensions={"size_bytes": size_bytes, "limit_bytes": limit_bytes},
+        )
+
+
 class ProjectSynthesisError(SiteBuilderError):
     """A bundle that is valid to edit, but would not produce a project that builds and starts."""
 

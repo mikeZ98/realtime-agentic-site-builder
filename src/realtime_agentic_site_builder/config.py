@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = Field(default=3600, ge=1)
     lock_lease_ms: int = Field(default=DEFAULT_LOCK_TIMEOUT_MS, ge=1, le=MAX_LOCK_TIMEOUT_MS)
     max_patch_size_bytes: int = Field(default=65536, ge=1)
+    # Every delta re-serializes the whole bundle on the event loop, so its size bounds that cost.
+    max_bundle_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+    # Each frame of the replay log holds a full bundle. Oldest frames go once this is exceeded.
+    replay_history_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     broadcast_fps: int = Field(default=30, ge=1, le=MAX_BROADCAST_FPS)
     log_level: LogLevel = "INFO"
 
@@ -45,6 +49,12 @@ class Settings(BaseSettings):
     gateway_drain_timeout_seconds: float = Field(default=5.0, gt=0)
     gateway_max_sessions: int = Field(default=1000, ge=1)
     gateway_max_concurrent_runs: int = Field(default=8, ge=1)
+    # Per-person limits, so that no one tenant can exhaust what the gateway's limits share out.
+    gateway_max_sessions_per_user: int = Field(default=10, ge=1)
+    gateway_max_concurrent_exports: int = Field(default=4, ge=1)
+    ws_max_connections_per_user: int = Field(default=8, ge=1)
+    ws_max_deltas_per_second: int = Field(default=10, ge=1)
+    ws_max_locks_per_user: int = Field(default=32, ge=1)
     max_request_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
     thought_backlog_size: int = Field(default=1000, ge=1)
     ws_catchup_deadline_ms: int = Field(default=5000, ge=1)

@@ -3,13 +3,19 @@
 import copy
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Final
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
-from realtime_agentic_site_builder.domain.base import CodePayload, canonical_json, thaw_json
+from realtime_agentic_site_builder.domain.base import (
+    CodePayload,
+    canonical_json,
+    sha256_hex,
+    thaw_json,
+)
 from realtime_agentic_site_builder.domain.blueprint import (
     BoundingBox,
     ComponentNode,
@@ -18,6 +24,7 @@ from realtime_agentic_site_builder.domain.blueprint import (
 )
 from realtime_agentic_site_builder.domain.errors import (
     ASTSyntaxCompilationError,
+    BundleTooLargeError,
     EndpointBindingNotFoundError,
 )
 from realtime_agentic_site_builder.domain.swarm import (
@@ -334,6 +341,18 @@ def changed_elements(
     return frozenset(changed)
 
 
+@dataclass(frozen=True, slots=True)
+class PatchResult:
+    bundle: FullstackProjectBundle
+    state_hash: str
+    size_bytes: int
+
+
+def bundle_size(bundle: FullstackProjectBundle) -> int:
+    """Measure a bundle as its canonical form, which is what hashing and replay serialize."""
+    return len(canonical_json(bundle.model_dump(mode="json")).encode())
+
+
 class PatchEngine:
     """Applies deltas to a private serialized copy of the bundle.
 
@@ -345,9 +364,11 @@ class PatchEngine:
         self,
         *,
         max_patch_size_bytes: int = DEFAULT_MAX_PATCH_SIZE_BYTES,
+        max_bundle_bytes: int | None = None,
         clock: Clock = system_now_ms,
     ) -> None:
         self._max_patch_size_bytes = max_patch_size_bytes
+        self._max_bundle_bytes = max_bundle_bytes
         self._clock = clock
 
     def apply_patch(
@@ -357,7 +378,18 @@ class PatchEngine:
         *,
         authorize: Authorizer = lambda _elements: None,
     ) -> tuple[FullstackProjectBundle, str]:
-        """Return the patched bundle and its state hash, or raise ``ASTSyntaxCompilationError``.
+        """Return the patched bundle and its state hash. See :meth:`apply`."""
+        result = self.apply(bundle, delta, authorize=authorize)
+        return result.bundle, result.state_hash
+
+    def apply(
+        self,
+        bundle: FullstackProjectBundle,
+        delta: StreamDelta,
+        *,
+        authorize: Authorizer = lambda _elements: None,
+    ) -> PatchResult:
+        """Apply a delta, or raise ``ASTSyntaxCompilationError`` or ``BundleTooLargeError``.
 
         ``authorize`` is given each operation's lock targets before that operation runs, and rejects
         the delta by raising. It defaults to allowing everything, so a replay of an already
@@ -400,7 +432,12 @@ class PatchEngine:
             raise ASTSyntaxCompilationError(
                 reason, line_number=len(delta.patches), syntax_token=None, code_snippet=encoded
             ) from error
-        return patched, patched.state_hash()
+        # One serialization yields both the hash and the size, so the limit costs nothing extra.
+        canonical = canonical_json(patched.model_dump(mode="json"))
+        size_bytes = len(canonical.encode())
+        if self._max_bundle_bytes is not None and size_bytes > self._max_bundle_bytes:
+            raise BundleTooLargeError(size_bytes=size_bytes, limit_bytes=self._max_bundle_bytes)
+        return PatchResult(patched, sha256_hex(canonical), size_bytes)
 
     def generate_snapshot(
         self,

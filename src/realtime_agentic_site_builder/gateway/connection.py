@@ -122,6 +122,7 @@ class ClientConnection:
             await asyncio.wait({egress, ingress})
             self._listener.close()
         if close is not None:
+            self._service.metrics.closes[close.reason] += 1
             await self._close(close)
 
     async def _close(self, close: CloseReason) -> None:
@@ -248,17 +249,17 @@ class ClientConnection:
         # Anyone with a token can watch and be seen. Changing anything is the owner's alone.
         self._service.require_owner(self.session_id, self.identity)
         if isinstance(message, LockAcquireMessage):
+            self._service.check_lock_quota(self.session_id, self.identity, message.target_id)
             lock = await self._hub.lock_manager(self.session_id).acquire(
                 message.target_id, self.identity.agent_id, HUMAN_LOCK_PRIORITY, self._hub.now_ms()
             )
-            self._service.note_lock(self.session_id, self.identity, message.target_id)
             ack = ack.model_copy(update={"lock": lock})
         elif isinstance(message, LockReleaseMessage):
             await self._hub.lock_manager(self.session_id).release(
                 message.target_id, self.identity.agent_id
             )
-            self._service.forget_lock(self.session_id, self.identity, message.target_id)
         elif isinstance(message, DeltaMessage):
+            self._service.spend_delta(self.identity)
             ack = ack.model_copy(update={"frame_seq": await self._commit(message)})
         else:
             self._service.start_run(self.session_id, message.text)
@@ -362,7 +363,8 @@ def _invalid(request_id: str | None, detail: str) -> str:
 
 
 def _request_id_of(text: str) -> str | None:
+    # Nesting deep enough to exhaust the stack fits well within the message size limit.
     try:
         return client_request_id(json.loads(text))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None

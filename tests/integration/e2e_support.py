@@ -35,6 +35,7 @@ from realtime_agentic_site_builder.core.hub import InMemoryEventBus
 from realtime_agentic_site_builder.domain.swarm import AgentRole
 from realtime_agentic_site_builder.gateway.auth import SUBPROTOCOL, TOKEN_SUBPROTOCOL_PREFIX
 from realtime_agentic_site_builder.gateway.service import GatewayService, create_app
+from realtime_agentic_site_builder.simulation.ticker import monotonic_ms
 
 FIXED_NOW_MS: Final = 1_800_000_000_000
 WAIT_S: Final = 5.0
@@ -142,7 +143,10 @@ class Gateway:
 
 @asynccontextmanager
 async def gateway(
-    config: Settings | None = None, *, provider: Any = None
+    config: Settings | None = None,
+    *,
+    provider: Any = None,
+    clock: Callable[[], int] | None = None,
 ) -> AsyncIterator[Gateway]:
     bus = InMemoryEventBus()
     app = create_app(
@@ -150,6 +154,7 @@ async def gateway(
         provider=provider or MockLLMProvider(),
         bus=bus,
         hub_clock=lambda: FIXED_NOW_MS,
+        clock=clock or monotonic_ms,
     )
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with (

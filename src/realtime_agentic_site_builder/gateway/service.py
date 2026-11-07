@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -12,7 +13,13 @@ from typing import Annotated, Any, Final, Literal, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -72,10 +79,20 @@ from realtime_agentic_site_builder.gateway.connection import (
     CanvasConnection,
     ClientConnection,
 )
+from realtime_agentic_site_builder.gateway.observability import (
+    GatewayMetrics,
+    RequestIdMiddleware,
+    current_request_id,
+    install_log_correlation,
+)
 from realtime_agentic_site_builder.gateway.protocol import CanvasHello, PromptText, SyncFrame
 from realtime_agentic_site_builder.simulation.controller import CursorSimulator
 from realtime_agentic_site_builder.simulation.ticker import SimulationTicker, monotonic_ms
-from realtime_agentic_site_builder.synthesis.exporter import ArchiveFormat, export_bundle
+from realtime_agentic_site_builder.synthesis.exporter import (
+    ArchiveFormat,
+    ProjectArchive,
+    export_bundle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +124,15 @@ class _SessionRuntime:
     simulator: CursorSimulator
     ticker: SimulationTicker
     run: asyncio.Task[None] | None = None
-    locks: dict[str, set[str]] = field(default_factory=dict)
     connections: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _Budget:
+    """A token bucket, so a burst is allowed but a sustained rate is not."""
+
+    tokens: float
+    refilled_at_ms: int
 
 
 class GatewayService:
@@ -133,6 +157,10 @@ class GatewayService:
         self._sleep = sleep
         self._sessions: dict[str, _SessionRuntime] = {}
         self._connections: set[ClientConnection] = set()
+        self._sockets_per_user: Counter[str] = Counter()
+        self._delta_budgets: dict[str, _Budget] = {}
+        self._exports_in_flight = 0
+        self.metrics = GatewayMetrics()
         self._sweeper: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -182,7 +210,15 @@ class GatewayService:
         self, identity: Identity, bundle: FullstackProjectBundle | None, prompt: str | None
     ) -> CreateSessionResponse:
         if len(self._sessions) >= self.settings.gateway_max_sessions:
+            self._refuse("sessions")
             raise CapacityExceededError("The gateway is at its session limit.")
+        owned = sum(runtime.owner == identity.user_id for runtime in self._sessions.values())
+        if owned >= self.settings.gateway_max_sessions_per_user:
+            # Without this, one tenant could take every session the gateway allows.
+            self._refuse("sessions_per_user")
+            raise CapacityExceededError(
+                f"You already have {owned} sessions open, which is the limit per person."
+            )
         # Generated here, so a session's id is not something anyone can guess or choose.
         session_id = f"s-{uuid.uuid4().hex}"
         snapshot = await self.hub.create_session(session_id, bundle or _empty_bundle(session_id))
@@ -218,8 +254,9 @@ class GatewayService:
         runtime = self._runtime(session_id)
         if runtime.run is not None:
             raise RunAlreadyActiveError("A run is already in progress in this session.")
-        active = sum(item.run is not None for item in self._sessions.values())
+        active = self.active_runs()
         if active >= self.settings.gateway_max_concurrent_runs:
+            self._refuse("concurrent_runs")
             raise CapacityExceededError("The gateway is at its limit of concurrent runs.")
         runtime.run = asyncio.create_task(self._run_swarm(session_id, runtime, prompt))
 
@@ -264,11 +301,85 @@ class GatewayService:
         with contextlib.suppress(SessionNotFoundError):
             await self.hub.broadcast_thought(session_id, thought)
 
-    def note_lock(self, session_id: str, identity: Identity, target_id: str) -> None:
-        self._runtime(session_id).locks.setdefault(identity.user_id, set()).add(target_id)
+    def _refuse(self, limit: str) -> None:
+        self.metrics.refusals[limit] += 1
 
-    def forget_lock(self, session_id: str, identity: Identity, target_id: str) -> None:
-        self._runtime(session_id).locks.get(identity.user_id, set()).discard(target_id)
+    def admit_socket(self, identity: Identity) -> None:
+        """Count a socket against its owner's limit. Pair every success with ``release_socket``.
+
+        Counted before the handshake completes and with no await in between, so a burst of
+        simultaneous connections cannot all slip under the limit together.
+        """
+        if self._sockets_per_user[identity.user_id] >= self.settings.ws_max_connections_per_user:
+            self._refuse("connections_per_user")
+            raise CapacityExceededError("Too many open connections for one person.")
+        self._sockets_per_user[identity.user_id] += 1
+
+    def release_socket(self, identity: Identity) -> None:
+        self._sockets_per_user[identity.user_id] -= 1
+        if self._sockets_per_user[identity.user_id] <= 0:
+            del self._sockets_per_user[identity.user_id]
+            self._delta_budgets.pop(identity.user_id, None)
+
+    def spend_delta(self, identity: Identity) -> None:
+        """Charge one human edit against a budget shared by all of that person's connections.
+
+        Each edit re-serializes and re-validates the whole bundle on the event loop, so a person
+        committing as fast as messages are allowed would slow every session on this worker.
+        """
+        rate = self.settings.ws_max_deltas_per_second
+        now_ms = self.clock()
+        budget = self._delta_budgets.setdefault(identity.user_id, _Budget(float(rate), now_ms))
+        elapsed_s = max(now_ms - budget.refilled_at_ms, 0) / 1000
+        budget.tokens = min(budget.tokens + elapsed_s * rate, float(rate))
+        budget.refilled_at_ms = now_ms
+        if budget.tokens < 1:
+            self._refuse("deltas_per_second")
+            raise CapacityExceededError(f"Edits are limited to {rate} per second per person.")
+        budget.tokens -= 1
+
+    def check_lock_quota(self, session_id: str, identity: Identity, target_id: str) -> None:
+        """Bound the locks one person holds or waits for, which every snapshot then carries."""
+        own = {
+            lock.target_id
+            for lock in self.hub.lock_manager(session_id).active_locks()
+            if lock.locked_by_agent_id == identity.agent_id
+        }
+        if target_id not in own and len(own) >= self.settings.ws_max_locks_per_user:
+            self._refuse("locks_per_user")
+            raise CapacityExceededError(
+                f"You already hold or wait for {len(own)} locks, which is the limit per person."
+            )
+
+    async def export(self, session_id: str, archive_format: ArchiveFormat) -> ProjectArchive:
+        """Synthesize off the event loop, refusing work beyond what the thread pool can absorb."""
+        bundle = self.hub.latest_snapshot(session_id).bundle_state
+        if self._exports_in_flight >= self.settings.gateway_max_concurrent_exports:
+            self._refuse("concurrent_exports")
+            raise CapacityExceededError("The gateway is busy with other exports. Retry shortly.")
+        self._exports_in_flight += 1
+        try:
+            archive = await asyncio.to_thread(export_bundle, bundle, archive_format)
+        except SiteBuilderError:
+            self.metrics.exports["rejected"] += 1
+            raise
+        finally:
+            self._exports_in_flight -= 1
+        self.metrics.exports["ok"] += 1
+        return archive
+
+    def gauges(self) -> tuple[tuple[str, str, float], ...]:
+        history = sum(self.hub.history_bytes(session_id) for session_id in self._sessions)
+        return (
+            ("rasb_sessions", "Open sessions.", len(self._sessions)),
+            ("rasb_connections", "Open sockets.", len(self._connections)),
+            ("rasb_runs_active", "Swarm runs in progress.", self.active_runs()),
+            ("rasb_exports_in_flight", "Exports being built.", self._exports_in_flight),
+            ("rasb_replay_history_bytes", "Bytes held by replay logs.", history),
+        )
+
+    def active_runs(self) -> int:
+        return sum(runtime.run is not None for runtime in self._sessions.values())
 
     def _canvas_connection(
         self,
@@ -339,25 +450,22 @@ class GatewayService:
         except SessionNotFoundError:
             await websocket.close(WS_SESSION_NOT_FOUND, "Session not found")
             return
-        replay = backlog.events if last_seen is not None else ()
-        gap = backlog.gap if last_seen is not None else False
-        connection: ClientConnection
-        if view == "canvas":
-            connection = self._canvas_connection(
-                websocket, identity, session_id, runtime, listener, snapshot, backlog, last_seen
+        try:
+            connection = self._connect(
+                websocket,
+                identity,
+                session_id,
+                runtime,
+                listener,
+                snapshot,
+                backlog,
+                last_seen,
+                view,
             )
-        else:
-            sync = SyncFrame(
-                session_id=session_id,
-                user_id=identity.user_id,
-                agent_id=identity.agent_id,
-                snapshot=snapshot,
-                latest_thought_seq=backlog.latest_seq,
-                replayed_thoughts=len(replay),
-                thought_gap=gap,
-            )
-            frames = (sync.model_dump_json(), *(event.model_dump_json() for event in replay))
-            connection = ClientConnection(self, websocket, identity, session_id, listener, frames)
+        except BaseException:
+            # A lossless listener nobody reads would hold every thought from now on.
+            listener.close()
+            raise
         self._connections.add(connection)
         runtime.connections[identity.user_id] = runtime.connections.get(identity.user_id, 0) + 1
         try:
@@ -369,6 +477,35 @@ class GatewayService:
                 await connection.announce_departure()
             await self._release_on_last_departure(session_id, runtime, identity)
 
+    def _connect(
+        self,
+        websocket: WebSocket,
+        identity: Identity,
+        session_id: str,
+        runtime: _SessionRuntime,
+        listener: SessionListener,
+        snapshot: SwarmSnapshot,
+        backlog: ThoughtBacklog,
+        last_seen: int | None,
+        view: SessionView | None,
+    ) -> ClientConnection:
+        if view == "canvas":
+            return self._canvas_connection(
+                websocket, identity, session_id, runtime, listener, snapshot, backlog, last_seen
+            )
+        replay = backlog.events if last_seen is not None else ()
+        sync = SyncFrame(
+            session_id=session_id,
+            user_id=identity.user_id,
+            agent_id=identity.agent_id,
+            snapshot=snapshot,
+            latest_thought_seq=backlog.latest_seq,
+            replayed_thoughts=len(replay),
+            thought_gap=backlog.gap if last_seen is not None else False,
+        )
+        frames = (sync.model_dump_json(), *(event.model_dump_json() for event in replay))
+        return ClientConnection(self, websocket, identity, session_id, listener, frames)
+
     async def _release_on_last_departure(
         self, session_id: str, runtime: _SessionRuntime, identity: Identity
     ) -> None:
@@ -378,9 +515,14 @@ class GatewayService:
         if remaining > 0:
             return
         del runtime.connections[identity.user_id]
-        targets = runtime.locks.pop(identity.user_id, set())
+        # Asked of the lock manager, which is the truth, rather than tracked alongside it.
         with contextlib.suppress(SessionNotFoundError):
             manager = self.hub.lock_manager(session_id)
+            targets = {
+                lock.target_id
+                for lock in manager.active_locks()
+                if lock.locked_by_agent_id == identity.agent_id
+            }
             for target_id in sorted(targets):
                 await manager.release(target_id, identity.agent_id)
 
@@ -428,8 +570,12 @@ class BodyLimitMiddleware:
 
 
 def _problem_response(problem: ProblemDetails, headers: dict[str, str] | None = None) -> Response:
+    body = problem.to_json_dict()
+    request_id = current_request_id()
+    if request_id is not None:
+        body["trace_id"] = request_id
     return JSONResponse(
-        problem.to_json_dict(),
+        body,
         status_code=problem.status or 500,
         media_type=PROBLEM_JSON_MEDIA_TYPE,
         headers=headers,
@@ -565,10 +711,9 @@ async def export_session(
     service: Service,
     archive_format: Annotated[ArchiveFormat, Query(alias="format")] = ArchiveFormat.ZIP,
 ) -> Response:
-    bundle = service.hub.latest_snapshot(session_id).bundle_state
     # Finished before the response starts, so a bundle that cannot be exported still gets a problem
     # document. Compiling and compressing a large project is too much work for the event loop.
-    archive = await asyncio.to_thread(export_bundle, bundle, archive_format)
+    archive = await service.export(session_id, archive_format)
     return StreamingResponse(
         archive.chunks(),
         media_type=archive.media_type,
@@ -583,6 +728,25 @@ async def export_session(
 async def delete_session(session_id: str, service: Service, identity: CurrentUser) -> Response:
     await service.close_session(identity, session_id)
     return Response(status_code=204)
+
+
+@router.get("/healthz", include_in_schema=False)
+async def healthz() -> Response:
+    """Liveness for orchestrators. It needs no token and says nothing about any session."""
+    return Response('{"status":"ok"}', media_type=JSON_MEDIA_TYPE)
+
+
+@router.get(
+    "/metrics",
+    response_class=PlainTextResponse,
+    include_in_schema=False,
+    dependencies=[Depends(_identity)],
+)
+async def metrics(service: Service) -> Response:
+    return PlainTextResponse(
+        service.metrics.render(service.gauges()),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @router.get("/canvas/{session_id}", response_class=HTMLResponse, include_in_schema=False)
@@ -615,8 +779,16 @@ async def session_socket(
         # Closing before accepting makes the server answer the handshake with a plain 403.
         await websocket.close(WS_POLICY_VIOLATION, "Authentication required")
         return
-    await websocket.accept(subprotocol=SUBPROTOCOL if SUBPROTOCOL in subprotocols else None)
-    await service.serve(websocket, identity, session_id, last_seen_thought_seq, view)
+    try:
+        service.admit_socket(identity)
+    except CapacityExceededError:
+        await websocket.close(WS_POLICY_VIOLATION, "Too many connections")
+        return
+    try:
+        await websocket.accept(subprotocol=SUBPROTOCOL if SUBPROTOCOL in subprotocols else None)
+        await service.serve(websocket, identity, session_id, last_seen_thought_seq, view)
+    finally:
+        service.release_socket(identity)
 
 
 def create_app(
@@ -658,8 +830,11 @@ def create_app(
             if owned_provider is not None:
                 await owned_provider.aclose()
 
+    install_log_correlation()
     app = FastAPI(title="Realtime Agentic Site Builder", lifespan=lifespan)
     app.add_middleware(BodyLimitMiddleware, limit=resolved.max_request_bytes)
+    # Added last, so it runs first: every response, including a refused body, gets an id.
+    app.add_middleware(RequestIdMiddleware)
     _install_error_handlers(app)
     app.include_router(router)
     return app

@@ -24,10 +24,15 @@ from redis.exceptions import RedisError
 from realtime_agentic_site_builder.config import Settings, get_settings
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
 from realtime_agentic_site_builder.core.lock_manager import AsyncLockManager, LockEvent
-from realtime_agentic_site_builder.core.patch_engine import PatchEngine, changed_elements
+from realtime_agentic_site_builder.core.patch_engine import (
+    PatchEngine,
+    bundle_size,
+    changed_elements,
+)
 from realtime_agentic_site_builder.domain.backend import FullstackProjectBundle
 from realtime_agentic_site_builder.domain.base import DomainModel, Identifier, NonNegativeInt
 from realtime_agentic_site_builder.domain.errors import (
+    BundleTooLargeError,
     DeltaRejectedError,
     ElementLockConflictError,
     SessionAlreadyExistsError,
@@ -271,6 +276,11 @@ class RedisEventBus:
                 logger.warning("event bus read failed: %r", error)
                 await asyncio.sleep(self._retry_delay_s)
                 continue
+            except Exception:
+                # Nothing watches this task, and its death would silently cut this worker off.
+                logger.exception("event bus reader hit an unexpected error")
+                await asyncio.sleep(self._retry_delay_s)
+                continue
             if message is not None:
                 self._deliver(message)
 
@@ -282,7 +292,11 @@ class RedisEventBus:
             logger.warning("discarding invalid event on %s: %s", channel, type(error).__name__)
             return
         for handler in tuple(self._handlers.get(channel, ())):
-            handler(event)
+            # One failing session must not stop delivery to every other session on this worker.
+            try:
+                handler(event)
+            except Exception:
+                logger.exception("event handler failed on %s", channel)
 
 
 def create_event_bus(settings: Settings) -> EventBus:
@@ -385,6 +399,8 @@ class _Session:
         capacity: int,
         backlog: int,
         now_ms: int,
+        first_frame_bytes: int,
+        history_budget_bytes: int,
     ) -> None:
         self.session_id = session_id
         self.origin = origin
@@ -395,8 +411,13 @@ class _Session:
         self.last_activity_ms = now_ms
         self.listeners: set[SessionListener] = set()
         self.agents: dict[str, AgentCursorFrame] = {}
-        self.deltas: list[StreamDelta] = []
-        self.snapshots = [first_frame]
+        self.deltas: deque[StreamDelta] = deque()
+        self.snapshots: deque[SwarmSnapshot] = deque([first_frame])
+        # Every frame holds a whole bundle, so the log is bounded by bytes rather than by count.
+        self.frame_bytes: deque[int] = deque([first_frame_bytes])
+        self.history_bytes = first_frame_bytes
+        self.history_budget_bytes = history_budget_bytes
+        self.last_committed_seq = -1
         self.reserved_delta_seq = -1
         self.pending_frames: dict[str, AgentCursorFrame] = {}
         self.pending_notices: deque[LockNotice] = deque(maxlen=capacity)
@@ -413,15 +434,27 @@ class _Session:
 
     @property
     def last_delta_seq(self) -> int:
-        return self.deltas[-1].delta_seq if self.deltas else -1
+        return self.last_committed_seq
 
     def fan_out(self, event: SwarmEvent) -> None:
         for listener in self.listeners:
             listener.offer(event)
 
-    def record(self, delta: StreamDelta, snapshot: SwarmSnapshot) -> None:
+    def record(self, delta: StreamDelta, snapshot: SwarmSnapshot, size_bytes: int) -> None:
+        """Append a commit, then forget the oldest frames until the log fits its budget again.
+
+        Frames go with the delta that followed them, so the oldest frame kept is always a valid base
+        to replay the remaining deltas from. The newest commit is always kept, whatever its size.
+        """
         self.deltas.append(delta)
         self.snapshots.append(snapshot)
+        self.frame_bytes.append(size_bytes)
+        self.history_bytes += size_bytes
+        self.last_committed_seq = delta.delta_seq
+        while self.history_bytes > self.history_budget_bytes and len(self.snapshots) > 2:
+            self.snapshots.popleft()
+            self.deltas.popleft()
+            self.history_bytes -= self.frame_bytes.popleft()
 
     def timeline(self) -> ReplayTimeline:
         # Built on demand: revalidating an ever-growing model per delta would cost quadratic time.
@@ -483,7 +516,9 @@ class SwarmSessionHub:
         self._sleep = sleep
         self._listener_capacity = listener_capacity
         self._engine = PatchEngine(
-            max_patch_size_bytes=self._settings.max_patch_size_bytes, clock=clock
+            max_patch_size_bytes=self._settings.max_patch_size_bytes,
+            max_bundle_bytes=self._settings.max_bundle_bytes,
+            clock=clock,
         )
         self._origin = uuid.uuid4().hex
         self._sessions: dict[str, _Session] = {}
@@ -498,6 +533,11 @@ class SwarmSessionHub:
         _SESSION_ID.validate_python(session_id)
         if session_id in self._sessions:
             raise SessionAlreadyExistsError(session_id=session_id)
+        size_bytes = bundle_size(initial_bundle)
+        if size_bytes > self._settings.max_bundle_bytes:
+            raise BundleTooLargeError(
+                size_bytes=size_bytes, limit_bytes=self._settings.max_bundle_bytes
+            )
         now_ms = self._clock()
         session = _Session(
             session_id,
@@ -510,6 +550,8 @@ class SwarmSessionHub:
             capacity=self._listener_capacity,
             backlog=self._settings.thought_backlog_size,
             now_ms=now_ms,
+            first_frame_bytes=size_bytes,
+            history_budget_bytes=self._settings.replay_history_bytes,
         )
         handler = partial(self._on_bus_event, session)
         self._sessions[session_id] = session
@@ -598,11 +640,12 @@ class SwarmSessionHub:
             now_ms = self._clock()
             session.require_locks(delta.agent_id, (delta.target_id,), now_ms)
             prior = session.latest.bundle_state
-            bundle, _ = self._engine.apply_patch(
+            result = self._engine.apply(
                 prior,
                 delta,
                 authorize=lambda touched: session.require_locks(delta.agent_id, touched, now_ms),
             )
+            bundle = result.bundle
             session.require_locks(delta.agent_id, changed_elements(prior, bundle), now_ms)
             snapshot = self._engine.generate_snapshot(
                 bundle,
@@ -613,7 +656,7 @@ class SwarmSessionHub:
                 # A wall clock can step backwards, but a replay's frames must not.
                 timestamp_ms=max(now_ms, session.latest.timestamp_ms),
             )
-            session.record(delta, snapshot)
+            session.record(delta, snapshot, result.size_bytes)
             session.last_activity_ms = now_ms
             event = StateEvent(
                 origin=self._origin, session_id=session_id, delta=delta, snapshot=snapshot
@@ -701,6 +744,10 @@ class SwarmSessionHub:
 
     def timeline(self, session_id: str) -> ReplayTimeline:
         return self._require(session_id).timeline()
+
+    def history_bytes(self, session_id: str) -> int:
+        """Report what the session's replay log holds, as measured against its budget."""
+        return self._require(session_id).history_bytes
 
     async def sweep(self, now_ms: int | None = None) -> tuple[str, ...]:
         """Reclaim lapsed locks in every session, close idle ones and return the closed ids."""
@@ -819,5 +866,9 @@ class SwarmSessionHub:
             return False
         # Workers' clocks skew, but this replica's own timeline has to stay ordered.
         timestamp_ms = max(snapshot.timestamp_ms, session.latest.timestamp_ms)
-        session.record(event.delta, snapshot.model_copy(update={"timestamp_ms": timestamp_ms}))
+        session.record(
+            event.delta,
+            snapshot.model_copy(update={"timestamp_ms": timestamp_ms}),
+            bundle_size(snapshot.bundle_state),
+        )
         return True
