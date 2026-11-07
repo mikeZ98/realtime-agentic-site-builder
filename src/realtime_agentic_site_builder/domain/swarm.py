@@ -112,6 +112,8 @@ class AgentThoughtStream(DomainModel):
     tool_args: FrozenJsonObject | None = None
     tokens_used: NonNegativeInt = 0
     execution_latency_ms: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.0
+    # Known only for model routes with a configured price.
+    cost_usd: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] | None = None
     timestamp_ms: UnixMillis
 
     @model_validator(mode="after")

@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
+from itertools import islice
 from typing import Annotated, Any, Final, Literal, Protocol, Self, cast
 
 from pydantic import Field, StrictBool, TypeAdapter, ValidationError, model_validator
@@ -35,6 +36,7 @@ from realtime_agentic_site_builder.domain.errors import (
     BundleTooLargeError,
     DeltaRejectedError,
     ElementLockConflictError,
+    FrameNotRetainedError,
     SessionAlreadyExistsError,
     SessionNotFoundError,
     SiteBuilderError,
@@ -538,19 +540,50 @@ class SwarmSessionHub:
             raise BundleTooLargeError(
                 size_bytes=size_bytes, limit_bytes=self._settings.max_bundle_bytes
             )
+        first_frame = self._engine.generate_snapshot(
+            initial_bundle, 0, _SESSION_CREATED_STEP, (), (), timestamp_ms=self._clock()
+        )
+        session = await self._open(session_id, first_frame, size_bytes)
+        return session.latest
+
+    async def fork_session(self, source_id: str, session_id: str, frame_seq: int) -> SwarmSnapshot:
+        """Branch a new session off another one's history, at one of the frames it still holds.
+
+        Frames and the bundles inside them are immutable, so the branch shares them with its
+        source rather than copying them: a fork costs a reference per frame, whatever its size.
+        Deltas are re-addressed to the branch, which copies the delta and shares its patches.
+        The branch starts with no locks, no thoughts and no clients.
+        """
+        _SESSION_ID.validate_python(session_id)
+        if session_id in self._sessions:
+            raise SessionAlreadyExistsError(session_id=session_id)
+        source = self._require(source_id)
+        earliest, latest = source.snapshots[0].frame_seq, source.latest.frame_seq
+        if not earliest <= frame_seq <= latest:
+            raise FrameNotRetainedError(frame_seq=frame_seq, earliest=earliest, latest=latest)
+        count = frame_seq - earliest + 1
+        frames = list(islice(source.snapshots, count))
+        sizes = list(islice(source.frame_bytes, count))
+        deltas = list(islice(source.deltas, count - 1))
+        session = await self._open(session_id, frames[0], sizes[0])
+        for delta, frame, size in zip(deltas, frames[1:], sizes[1:], strict=True):
+            session.record(delta.model_copy(update={"session_id": session_id}), frame, size)
+        return session.latest
+
+    async def _open(
+        self, session_id: str, first_frame: SwarmSnapshot, first_frame_bytes: int
+    ) -> _Session:
         now_ms = self._clock()
         session = _Session(
             session_id,
             origin=self._origin,
-            first_frame=self._engine.generate_snapshot(
-                initial_bundle, 0, _SESSION_CREATED_STEP, (), (), timestamp_ms=now_ms
-            ),
+            first_frame=first_frame,
             lease_ms=self._settings.lock_lease_ms,
             clock=self._clock,
             capacity=self._listener_capacity,
             backlog=self._settings.thought_backlog_size,
             now_ms=now_ms,
-            first_frame_bytes=size_bytes,
+            first_frame_bytes=first_frame_bytes,
             history_budget_bytes=self._settings.replay_history_bytes,
         )
         handler = partial(self._on_bus_event, session)
@@ -562,7 +595,7 @@ class SwarmSessionHub:
         except BaseException:
             await self._discard(session)
             raise
-        return session.latest
+        return session
 
     async def close_session(self, session_id: str) -> ReplayTimeline:
         """End a session once in-flight deltas finish, and return its complete replay log."""

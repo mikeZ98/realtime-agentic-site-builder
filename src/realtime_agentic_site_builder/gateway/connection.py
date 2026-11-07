@@ -12,10 +12,20 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from realtime_agentic_site_builder.canvas.compositor import (
     CanvasCompositor,
+    CanvasOverride,
     CanvasScene,
+    canvas_delta,
+    participant,
     thought_entry,
 )
-from realtime_agentic_site_builder.core.hub import SessionListener, SwarmSessionHub, ThoughtEvent
+from realtime_agentic_site_builder.core.hub import (
+    LockNotice,
+    SessionListener,
+    StateEvent,
+    SwarmSessionHub,
+    ThoughtEvent,
+)
+from realtime_agentic_site_builder.core.lock_manager import LockEventKind
 from realtime_agentic_site_builder.domain.errors import SessionNotFoundError, SiteBuilderError
 from realtime_agentic_site_builder.domain.swarm import StreamDelta
 from realtime_agentic_site_builder.gateway.auth import Identity
@@ -27,6 +37,7 @@ from realtime_agentic_site_builder.gateway.protocol import (
     DeltaMessage,
     ErrorFrame,
     LockAcquireMessage,
+    LockOverrideMessage,
     LockReleaseMessage,
     PingMessage,
     PongFrame,
@@ -47,6 +58,8 @@ WS_INTERNAL_ERROR: Final = 1011
 WS_SESSION_NOT_FOUND: Final = 4404
 # A person outranks the swarm's coder but not its architect, and cannot choose differently.
 HUMAN_LOCK_PRIORITY: Final = 80
+# Above every agent's. Used only by an explicit override, which takes a lock from its holder.
+HUMAN_OVERRIDE_PRIORITY: Final = 95
 _CLOSE_TIMEOUT_S: Final = 1.0
 _MAX_PENDING_REPLIES: Final = 256
 
@@ -258,6 +271,15 @@ class ClientConnection:
             await self._hub.lock_manager(self.session_id).release(
                 message.target_id, self.identity.agent_id
             )
+        elif isinstance(message, LockOverrideMessage):
+            self._service.check_lock_quota(self.session_id, self.identity, message.target_id)
+            lock = await self._hub.lock_manager(self.session_id).override(
+                message.target_id,
+                self.identity.agent_id,
+                HUMAN_OVERRIDE_PRIORITY,
+                self._hub.now_ms(),
+            )
+            ack = ack.model_copy(update={"lock": lock})
         elif isinstance(message, DeltaMessage):
             self._service.spend_delta(self.identity)
             ack = ack.model_copy(update={"frame_seq": await self._commit(message)})
@@ -338,6 +360,14 @@ class CanvasConnection(ClientConnection):
                 self._compositor.apply(event, now_ms)
                 if isinstance(event, ThoughtEvent):
                     thoughts.append(thought_entry(event).model_dump_json())
+                elif isinstance(event, StateEvent):
+                    thoughts.append(canvas_delta(event).model_dump_json())
+                elif isinstance(event, LockNotice) and event.event.kind is LockEventKind.OVERRIDDEN:
+                    override = CanvasOverride(
+                        target_id=event.event.lock.target_id,
+                        by=participant(event.event.lock.locked_by_agent_id),
+                    )
+                    thoughts.append(override.model_dump_json())
             if self._listener.closed:
                 return self._end_reason
             for thought in thoughts:

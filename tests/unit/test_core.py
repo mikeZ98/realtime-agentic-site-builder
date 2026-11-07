@@ -1150,8 +1150,15 @@ async def test_random_workload_preserves_lock_invariants(seed: int) -> None:
                 LockState.WAITING,
                 LockState.CONFLICT_RESOLVED,
             }
-        elif action < 0.9:
+        elif action < 0.85:
             await manager.release(target, agent)
+        elif action < 0.93:
+            # A person's override must keep every invariant that ordinary arbitration keeps.
+            lock = await manager.override(target, agent, 95, clock.now)
+            assert lock.locked_by_agent_id == agent
+            assert lock == manager._record_of(target, agent) or (
+                lock.state is LockState.CONFLICT_RESOLVED
+            ), "the answer is the manager's own record, or the deadlock it lost"
         else:
             await manager.sweep_expired(clock.now)
 

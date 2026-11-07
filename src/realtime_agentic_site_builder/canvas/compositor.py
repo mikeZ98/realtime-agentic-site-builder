@@ -35,6 +35,7 @@ from realtime_agentic_site_builder.domain.swarm import (
     AgentRole,
     ElementLock,
     LockState,
+    PatchOperation,
 )
 from realtime_agentic_site_builder.gateway.auth import AGENT_ID_PREFIX
 from realtime_agentic_site_builder.simulation.motion import (
@@ -49,6 +50,7 @@ SWARM_PALETTE: Final[Mapping[AgentRole, str]] = {
     role: identity.color for role, identity in IDENTITIES.items()
 }
 UNOWNED_COLOR: Final = "#94A3B8"
+_GRAPH_TOOLS: Final = frozenset({"graph.enter", "graph.exit"})
 DOCKING_ACTIONS: Final = frozenset(
     {
         AgentAction.EDITING,
@@ -140,11 +142,36 @@ class ThoughtEntry(DomainModel):
     color: str
     text: str
     tool_name: str | None = None
+    # What the HUD reads: which graph node started or ended, the critic's verdict, and spend.
+    node: str | None = None
+    approved: bool | None = None
+    tokens: int = 0
+    cost_usd: float | None = None
+
+
+class CanvasDelta(DomainModel):
+    """A committed change. Frontend patches come with it, for the viewer's live DOM mirror."""
+
+    kind: Literal["canvas.delta"] = "canvas.delta"
+    frame_seq: int
+    delta_seq: int
+    agent_id: str
+    target_domain: Literal["frontend", "backend"]
+    patches: tuple[PatchOperation, ...] = ()
+
+
+class CanvasOverride(DomainModel):
+    """A person took an element away from an agent, which every viewer should see happen."""
+
+    kind: Literal["canvas.override"] = "canvas.override"
+    target_id: str
+    by: Participant
 
 
 class LockOverlay(DomainModel):
     id: str
     title: str
+    component_type: str
     box: NormalizedBox
     state: OverlayState
     owner: Participant | None = None
@@ -200,6 +227,9 @@ def _snippet(text: str) -> str:
 def thought_entry(event: ThoughtEvent) -> ThoughtEntry:
     thought = event.thought
     who = participant(thought.agent_id)
+    arguments = thought.tool_args or {}
+    node = arguments.get("node") if thought.tool_name in _GRAPH_TOOLS else None
+    approved = arguments.get("approved") if thought.tool_name == "critic.verdict" else None
     return ThoughtEntry(
         seq=event.seq,
         agent_id=who.id,
@@ -207,6 +237,21 @@ def thought_entry(event: ThoughtEvent) -> ThoughtEntry:
         color=who.color,
         text=_snippet(thought.thought),
         tool_name=thought.tool_name,
+        node=node if isinstance(node, str) else None,
+        approved=approved if isinstance(approved, bool) else None,
+        tokens=thought.tokens_used,
+        cost_usd=thought.cost_usd,
+    )
+
+
+def canvas_delta(event: StateEvent) -> CanvasDelta:
+    delta = event.delta
+    return CanvasDelta(
+        frame_seq=event.snapshot.frame_seq,
+        delta_seq=delta.delta_seq,
+        agent_id=delta.agent_id,
+        target_domain=delta.target_domain,
+        patches=delta.patches if delta.target_domain == "frontend" else (),
     )
 
 
@@ -469,6 +514,7 @@ def _overlay(
     return LockOverlay(
         id=component.id,
         title=component.title,
+        component_type=component.component_type.value,
         box=normalize_box(component.box, viewport),
         state=state,
         owner=None if holder is None else participant(holder),

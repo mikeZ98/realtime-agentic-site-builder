@@ -6,8 +6,10 @@ from enum import StrEnum
 from realtime_agentic_site_builder.core.clock import Clock, system_now_ms
 from realtime_agentic_site_builder.domain.base import DomainModel
 from realtime_agentic_site_builder.domain.errors import (
+    ElementLockConflictError,
     LockAcquisitionTimeoutError,
     ProblemDetails,
+    element_resource_uri,
 )
 from realtime_agentic_site_builder.domain.swarm import (
     DEFAULT_LOCK_TIMEOUT_MS,
@@ -23,6 +25,8 @@ class LockEventKind(StrEnum):
     PROMOTED = "PROMOTED"
     PREEMPTED = "PREEMPTED"
     TIMED_OUT = "TIMED_OUT"
+    # A person took an element from a lower-priority holder, which priority alone never does.
+    OVERRIDDEN = "OVERRIDDEN"
 
 
 class LockEvent(DomainModel):
@@ -86,6 +90,43 @@ class AsyncLockManager:
         if arbitration.request.state is LockState.ACQUIRED:
             # The lease lapsed before a sweep noticed. The queue decides who is next, not arrival.
             self._reclaim_holder(holder, now_ms)
+        preempted = self._settle(now_ms)
+        return self._record_of(target_id, agent_id) or preempted[target_id, agent_id]
+
+    async def override(
+        self, target_id: str, agent_id: str, priority: int, now_ms: int
+    ) -> ElementLock:
+        """Take an element now, preempting a live holder of lower priority.
+
+        This is the one exception to the rule that priority never takes a lock from a live holder,
+        and it exists for a person to stop an agent. The holder loses only this element, and is
+        told with a ``PREEMPTED`` event. Everyone else learns of it from an ``OVERRIDDEN`` one.
+        Against a holder of equal or higher priority, or no holder, this is a plain acquire.
+        """
+        holder = self._holders.get(target_id)
+        if (
+            holder is None
+            or holder.locked_by_agent_id == agent_id
+            or holder.is_expired(now_ms)
+            or holder.priority >= priority
+        ):
+            return await self.acquire(target_id, agent_id, priority, now_ms)
+        del self._holders[target_id]
+        self._withdraw(target_id, agent_id)
+        error = ElementLockConflictError(
+            competing_agent_ids=(holder.locked_by_agent_id, agent_id),
+            resource_uri=element_resource_uri(target_id),
+        )
+        revoked = holder.model_copy(update={"state": LockState.CONFLICT_RESOLVED})
+        self._on_event(
+            LockEvent(kind=LockEventKind.PREEMPTED, lock=revoked, problem=error.to_problem())
+        )
+        granted = self._new_lock(target_id, agent_id, priority, now_ms).model_copy(
+            update={"state": LockState.ACQUIRED}
+        )
+        self._holders[target_id] = granted
+        self._on_event(LockEvent(kind=LockEventKind.OVERRIDDEN, lock=granted))
+        # Whatever settling then decides is the answer, exactly as for an ordinary acquire.
         preempted = self._settle(now_ms)
         return self._record_of(target_id, agent_id) or preempted[target_id, agent_id]
 

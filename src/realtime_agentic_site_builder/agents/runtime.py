@@ -201,6 +201,7 @@ class NodeContext:
         tool_args: Mapping[str, Any] | None,
         tokens_used: int,
         latency_ms: float,
+        cost_usd: float | None = None,
     ) -> AgentThoughtStream:
         common: dict[str, Any] = {
             "agent_id": self.identity.agent_id,
@@ -209,6 +210,7 @@ class NodeContext:
             "tool_args": tool_args,
             "tokens_used": tokens_used,
             "execution_latency_ms": latency_ms,
+            "cost_usd": cost_usd,
             "timestamp_ms": self.runtime.hub.now_ms(),
         }
         try:
@@ -226,6 +228,7 @@ class NodeContext:
         tool_args: Mapping[str, Any] | None = None,
         tokens_used: int = 0,
         latency_ms: float = 0.0,
+        cost_usd: float | None = None,
         target_id: str | None = None,
         lock: ElementLock | None = None,
     ) -> None:
@@ -234,7 +237,7 @@ class NodeContext:
         The thought goes on the lossless channel. The frame repeats it only as the caption for a
         cursor, and frames conflate, so consumers wanting the full stream read ``ThoughtEvent``.
         """
-        thought = self._thought(text, tool_name, tool_args, tokens_used, latency_ms)
+        thought = self._thought(text, tool_name, tool_args, tokens_used, latency_ms, cost_usd)
         self.thoughts.append(thought)
         await self.runtime.hub.broadcast_thought(self.session_id, thought)
         box = self._box_of(target_id)
@@ -269,13 +272,18 @@ class NodeContext:
         )
         client = self.runtime.provider.client_for(self.identity.role)
         result = await client.generate_structured(request)
+        price = self.runtime.hub.settings.model_prices.get(result.model)
+        usage = result.usage
         await self.emit(
             AgentAction.THINKING,
             result.output.rationale or f"{self.identity.name} finished thinking.",
             tool_name="llm.generate",
             tool_args={"model": result.model, "schema": schema.__name__},
-            tokens_used=result.usage.total_tokens,
+            tokens_used=usage.total_tokens,
             latency_ms=result.latency_ms,
+            cost_usd=(
+                None if price is None else price.cost_usd(usage.input_tokens, usage.output_tokens)
+            ),
             target_id=target_id,
         )
         return result

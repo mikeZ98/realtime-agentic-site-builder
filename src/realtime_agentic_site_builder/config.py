@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Annotated, Final, Literal
 
-from pydantic import Field, RedisDsn, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, RedisDsn, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from realtime_agentic_site_builder.domain.swarm import DEFAULT_LOCK_TIMEOUT_MS, MAX_LOCK_TIMEOUT_MS
@@ -14,6 +14,20 @@ MAX_BROADCAST_FPS: Final = 240
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 # "<endpoint>:<model>", so each tier can use a different vendor.
 ModelRoute = Annotated[str, Field(pattern=r"^(anthropic|openrouter):\S+$")]
+
+
+class ModelPrice(BaseModel):
+    """What a model charges, in US dollars per million tokens."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    input_usd_per_mtok: float = Field(ge=0, allow_inf_nan=False)
+    output_usd_per_mtok: float = Field(ge=0, allow_inf_nan=False)
+
+    def cost_usd(self, input_tokens: int, output_tokens: int) -> float:
+        return (
+            input_tokens * self.input_usd_per_mtok + output_tokens * self.output_usd_per_mtok
+        ) / 1_000_000
 
 
 class Settings(BaseSettings):
@@ -42,6 +56,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
     agent_max_iterations: int = Field(default=3, ge=1, le=20)
     agent_lock_wait_ms: int = Field(default=120_000, ge=1)
+    # Keyed by the model id a provider reports, such as "claude-sonnet-5-5". Prices change, so
+    # none are built in: a model without one reports tokens, and no cost.
+    model_prices: dict[str, ModelPrice] = Field(default_factory=dict)
 
     # Signs client tokens. The gateway refuses to start without it: `prompt` spends real money.
     gateway_secret: SecretStr | None = Field(default=None, min_length=32)

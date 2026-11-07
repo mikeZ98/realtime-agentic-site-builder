@@ -42,6 +42,7 @@ from realtime_agentic_site_builder.core.hub import (
     ThoughtBacklog,
     ThoughtEvent,
 )
+from realtime_agentic_site_builder.core.invariants import InvariantReport, verify_timeline
 from realtime_agentic_site_builder.domain.backend import (
     BackendBlueprint,
     DatabaseDialect,
@@ -56,6 +57,7 @@ from realtime_agentic_site_builder.domain.errors import (
     GatewayConfigurationError,
     PermissionDeniedError,
     ProblemDetails,
+    ProjectSynthesisError,
     RunAlreadyActiveError,
     SessionNotFoundError,
     SiteBuilderError,
@@ -63,7 +65,9 @@ from realtime_agentic_site_builder.domain.errors import (
 from realtime_agentic_site_builder.domain.swarm import (
     AgentRole,
     AgentThoughtStream,
+    ElementLock,
     ReplayTimeline,
+    StreamDelta,
     SwarmSnapshot,
 )
 from realtime_agentic_site_builder.gateway.auth import (
@@ -109,6 +113,46 @@ class CreateSessionResponse(DomainModel):
     session_id: str
     snapshot: SwarmSnapshot
     run_started: bool
+
+
+class HistoryEntry(DomainModel):
+    frame_seq: int
+    timestamp_ms: int
+    bundle_hash: str
+    delta: StreamDelta
+    locks: tuple[ElementLock, ...]
+
+
+class HistoryResponse(DomainModel):
+    """Enough to rebuild the layout at every frame held, without a full bundle per frame."""
+
+    session_id: str
+    base_frame_seq: int
+    base_bundle_hash: str
+    base_frontend: SiteBlueprint
+    base_locks: tuple[ElementLock, ...]
+    entries: tuple[HistoryEntry, ...]
+
+
+def history_of(timeline: ReplayTimeline) -> HistoryResponse:
+    base = timeline.snapshots[0]
+    return HistoryResponse(
+        session_id=timeline.session_id,
+        base_frame_seq=base.frame_seq,
+        base_bundle_hash=base.bundle_hash,
+        base_frontend=base.bundle_state.frontend,
+        base_locks=base.active_locks,
+        entries=tuple(
+            HistoryEntry(
+                frame_seq=frame.frame_seq,
+                timestamp_ms=frame.timestamp_ms,
+                bundle_hash=frame.bundle_hash,
+                delta=delta,
+                locks=frame.active_locks,
+            )
+            for delta, frame in zip(timeline.deltas, timeline.snapshots[1:], strict=True)
+        ),
+    )
 
 
 class TimelineResponse(DomainModel):
@@ -209,6 +253,18 @@ class GatewayService:
     async def create_session(
         self, identity: Identity, bundle: FullstackProjectBundle | None, prompt: str | None
     ) -> CreateSessionResponse:
+        self._admit_session(identity)
+        # Generated here, so a session's id is not something anyone can guess or choose.
+        session_id = f"s-{uuid.uuid4().hex}"
+        snapshot = await self.hub.create_session(session_id, bundle or _empty_bundle(session_id))
+        self._start_runtime(identity, session_id)
+        if prompt is not None:
+            self.start_run(session_id, prompt)
+        return CreateSessionResponse(
+            session_id=session_id, snapshot=snapshot, run_started=prompt is not None
+        )
+
+    def _admit_session(self, identity: Identity) -> None:
         if len(self._sessions) >= self.settings.gateway_max_sessions:
             self._refuse("sessions")
             raise CapacityExceededError("The gateway is at its session limit.")
@@ -219,18 +275,12 @@ class GatewayService:
             raise CapacityExceededError(
                 f"You already have {owned} sessions open, which is the limit per person."
             )
-        # Generated here, so a session's id is not something anyone can guess or choose.
-        session_id = f"s-{uuid.uuid4().hex}"
-        snapshot = await self.hub.create_session(session_id, bundle or _empty_bundle(session_id))
+
+    def _start_runtime(self, identity: Identity, session_id: str) -> None:
         simulator = CursorSimulator()
         ticker = SimulationTicker(self.hub, session_id, simulator)
         self._sessions[session_id] = _SessionRuntime(identity.user_id, simulator, ticker)
         ticker.start()
-        if prompt is not None:
-            self.start_run(session_id, prompt)
-        return CreateSessionResponse(
-            session_id=session_id, snapshot=snapshot, run_started=prompt is not None
-        )
 
     def _runtime(self, session_id: str) -> _SessionRuntime:
         runtime = self._sessions.get(session_id)
@@ -351,22 +401,42 @@ class GatewayService:
                 f"You already hold or wait for {len(own)} locks, which is the limit per person."
             )
 
-    async def export(self, session_id: str, archive_format: ArchiveFormat) -> ProjectArchive:
-        """Synthesize off the event loop, refusing work beyond what the thread pool can absorb."""
-        bundle = self.hub.latest_snapshot(session_id).bundle_state
+    async def _heavy[T](self, work: Callable[[], T]) -> T:
+        """Run CPU-bound work off the event loop, refusing what the thread pool cannot absorb."""
         if self._exports_in_flight >= self.settings.gateway_max_concurrent_exports:
             self._refuse("concurrent_exports")
             raise CapacityExceededError("The gateway is busy with other exports. Retry shortly.")
         self._exports_in_flight += 1
         try:
-            archive = await asyncio.to_thread(export_bundle, bundle, archive_format)
-        except SiteBuilderError:
-            self.metrics.exports["rejected"] += 1
-            raise
+            return await asyncio.to_thread(work)
         finally:
             self._exports_in_flight -= 1
+
+    async def export(self, session_id: str, archive_format: ArchiveFormat) -> ProjectArchive:
+        bundle = self.hub.latest_snapshot(session_id).bundle_state
+        try:
+            archive = await self._heavy(lambda: export_bundle(bundle, archive_format))
+        except ProjectSynthesisError:
+            # A refusal for being busy is counted among refusals, not as a project that failed.
+            self.metrics.exports["rejected"] += 1
+            raise
         self.metrics.exports["ok"] += 1
         return archive
+
+    async def verify(self, session_id: str) -> InvariantReport:
+        """Check the session's invariants over the history it still holds."""
+        timeline = self.hub.timeline(session_id)
+        return await self._heavy(lambda: verify_timeline(timeline))
+
+    async def fork_session(
+        self, identity: Identity, source_id: str, frame_seq: int
+    ) -> CreateSessionResponse:
+        """Branch another session at one of its frames, into a new session this person owns."""
+        self._admit_session(identity)
+        session_id = f"s-{uuid.uuid4().hex}"
+        snapshot = await self.hub.fork_session(source_id, session_id, frame_seq)
+        self._start_runtime(identity, session_id)
+        return CreateSessionResponse(session_id=session_id, snapshot=snapshot, run_started=False)
 
     def gauges(self) -> tuple[tuple[str, str, float], ...]:
         history = sum(self.hub.history_bytes(session_id) for session_id in self._sessions)
@@ -414,6 +484,8 @@ class GatewayService:
             latest_thought_seq=backlog.latest_seq,
             replayed_thoughts=len(replay),
             thought_gap=gap,
+            frame_seq=snapshot.frame_seq,
+            frontend=snapshot.bundle_state.frontend,
         )
         return CanvasConnection(
             self,
@@ -722,6 +794,51 @@ async def export_session(
             "Content-Length": str(len(archive.content)),
         },
     )
+
+
+@router.post(
+    "/api/v1/sessions/{session_id}/fork",
+    status_code=201,
+    responses={201: {"model": CreateSessionResponse}},
+)
+async def fork_session(
+    session_id: str,
+    service: Service,
+    identity: CurrentUser,
+    from_seq: Annotated[int, Query(ge=0)],
+) -> Response:
+    """Branch the session at frame ``from_seq`` into a new one, owned by whoever asked."""
+    forked = await service.fork_session(identity, session_id, from_seq)
+    return Response(
+        forked.model_dump_json(),
+        status_code=201,
+        media_type=JSON_MEDIA_TYPE,
+        headers={"Location": f"/api/v1/sessions/{forked.session_id}"},
+    )
+
+
+@router.get(
+    "/api/v1/sessions/{session_id}/history",
+    responses={200: {"model": HistoryResponse}},
+    dependencies=[Depends(_identity)],
+)
+async def get_history(session_id: str, service: Service) -> Response:
+    """The replay window in its compact form: one base layout, then each delta and its locks."""
+    timeline = service.hub.timeline(session_id)
+    return Response(
+        await asyncio.to_thread(lambda: history_of(timeline).model_dump_json()),
+        media_type=JSON_MEDIA_TYPE,
+    )
+
+
+@router.get(
+    "/api/v1/sessions/{session_id}/verify",
+    responses={200: {"model": InvariantReport}},
+    dependencies=[Depends(_identity)],
+)
+async def verify_session(session_id: str, service: Service) -> Response:
+    report = await service.verify(session_id)
+    return Response(report.model_dump_json(), media_type=JSON_MEDIA_TYPE)
 
 
 @router.delete("/api/v1/sessions/{session_id}", status_code=204)

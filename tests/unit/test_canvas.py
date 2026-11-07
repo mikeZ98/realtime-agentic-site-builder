@@ -917,6 +917,10 @@ def test_a_thought_becomes_a_feed_entry_that_names_its_author() -> None:
         "color": "#8B5CF6",
         "text": "Planning",
         "tool_name": "llm.generate",
+        "node": None,
+        "approved": None,
+        "tokens": 0,
+        "cost_usd": None,
     }
 
 
@@ -1305,6 +1309,8 @@ async def test_canvas_view_opens_with_a_hello_and_the_full_scene() -> None:
             "latest_thought_seq": None,
             "replayed_thoughts": 0,
             "thought_gap": False,
+            "frame_seq": 0,
+            "frontend": page().frontend.model_dump(mode="json"),
         }
         frame = await socket.receive()
         assert frame["kind"] == "canvas"

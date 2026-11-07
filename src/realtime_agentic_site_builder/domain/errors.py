@@ -242,6 +242,23 @@ class BundleTooLargeError(SiteBuilderError):
         )
 
 
+class FrameNotRetainedError(SiteBuilderError):
+    """A frame outside the replay window a session still holds."""
+
+    status: ClassVar[int] = 404
+    title: ClassVar[str] = "Frame not retained"
+    slug: ClassVar[str] = "frame-not-retained"
+
+    def __init__(
+        self, *, frame_seq: int, earliest: int, latest: int, instance: str | None = None
+    ) -> None:
+        super().__init__(
+            f"Frame {frame_seq} is not held. This session holds frames {earliest} to {latest}.",
+            instance=instance,
+            extensions={"frame_seq": frame_seq, "earliest": earliest, "latest": latest},
+        )
+
+
 class ProjectSynthesisError(SiteBuilderError):
     """A bundle that is valid to edit, but would not produce a project that builds and starts."""
 

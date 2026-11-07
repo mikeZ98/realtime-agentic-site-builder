@@ -9,6 +9,7 @@ from typing import Annotated, Any, Final, Literal
 from pydantic import Field, JsonValue, TypeAdapter
 
 from realtime_agentic_site_builder.domain.base import MAX_TEXT_LENGTH, DomainModel, Identifier
+from realtime_agentic_site_builder.domain.blueprint import SiteBlueprint
 from realtime_agentic_site_builder.domain.swarm import (
     ElementLock,
     PatchOperation,
@@ -50,6 +51,13 @@ class LockReleaseMessage(_ClientMessage):
     target_id: Identifier
 
 
+class LockOverrideMessage(_ClientMessage):
+    """Take an element from whoever holds it, at a priority above every agent's."""
+
+    type: Literal["lock.override"]
+    target_id: Identifier
+
+
 class DeltaMessage(_ClientMessage):
     """A patch to commit. The server supplies who it is from and where it falls in sequence."""
 
@@ -70,6 +78,7 @@ ClientMessage = (
     | SelectMessage
     | LockAcquireMessage
     | LockReleaseMessage
+    | LockOverrideMessage
     | DeltaMessage
     | PromptMessage
 )
@@ -102,6 +111,9 @@ class CanvasHello(DomainModel):
     latest_thought_seq: int | None
     replayed_thoughts: int
     thought_gap: bool
+    # The layout as of ``frame_seq``, which canvas.delta frames then patch in place.
+    frame_seq: int
+    frontend: SiteBlueprint
 
 
 class PongFrame(DomainModel):
