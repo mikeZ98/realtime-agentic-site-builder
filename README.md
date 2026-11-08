@@ -1,15 +1,16 @@
 # realtime-agentic-site-builder
 
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
+![Ruff](https://img.shields.io/badge/lint-ruff-D7FF64?logo=ruff&logoColor=black)
+![mypy strict](https://img.shields.io/badge/mypy-strict-2563EB)
+![Coverage 100%](https://img.shields.io/badge/coverage-100%25%20line%20%2B%20branch-10B981)
+![Network-free tests](https://img.shields.io/badge/tests-network--free-8B5CF6)
+[![Committer mikeZ98](https://img.shields.io/badge/committer-mikeZ98-lightgrey.svg)](https://github.com/mikeZ98/realtime-agentic-site-builder/commits/main)
+
 **A swarm of AI agents builds a full-stack website together, live, while people watch and steer.**
 Six agent roles plan, code, style and review a FastAPI + React project concurrently. Every change
 is a lock-checked RFC 6902 patch, every thought streams to every viewer in order, and the result
 compiles into a runnable, byte-reproducible repository.
-
-![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
-![Coverage 100%](https://img.shields.io/badge/coverage-100%25%20line%20%2B%20branch-10B981)
-![mypy strict](https://img.shields.io/badge/mypy-strict-2563EB)
-![Ruff](https://img.shields.io/badge/lint-ruff-D7FF64?logo=ruff&logoColor=black)
-![Network-free tests](https://img.shields.io/badge/tests-network--free-8B5CF6)
 
 ![Six agents working a shared canvas over a live mirror of the site they are building: sections retitle as commits land, each with a spring kick and a halo in its author's color, under Bézier cursor trails, lock outlines, docked thought badges and a heads-up display whose graph radar pulses on a critic's rejection](docs/assets/swarm-live-demo.gif)
 
